@@ -8,214 +8,349 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/TFMV/resolve/config"
-	"github.com/TFMV/resolve/internal/embed"
-	"github.com/TFMV/resolve/internal/match"
-	"github.com/TFMV/resolve/internal/qdrant"
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	"github.com/TFMV/resolve/internal/config"
+	"github.com/TFMV/resolve/internal/weaviate"
+	"github.com/gorilla/mux"
 )
 
-// Server represents the HTTP API server
-type Server struct {
-	router           *chi.Mux
-	matchService     *match.Service
-	config           *config.Config
-	qdrantClient     *qdrant.Client
-	embeddingService embed.EmbeddingService
-}
+// Time format constant
+const timeFormat = time.RFC3339
 
-// MatchRequest represents a match request
+// timeNow returns the current time
+var timeNow = time.Now
+
+// MatchRequest represents a request to match an entity
 type MatchRequest struct {
-	Text           string  `json:"text"`
-	Limit          int     `json:"limit,omitempty"`
-	Threshold      float32 `json:"threshold,omitempty"`
-	IncludeDetails bool    `json:"include_details,omitempty"`
+	Entity    *weaviate.EntityRecord `json:"entity"`
+	Threshold float64                `json:"threshold"`
+	Limit     int                    `json:"limit"`
 }
 
-// IngestRequest represents an ingestion request
-type IngestRequest struct {
-	Entities []match.EntityData `json:"entities"`
-}
-
-// ErrorResponse represents an error response
-type ErrorResponse struct {
-	Error string `json:"error"`
+// Server represents the API server
+type Server struct {
+	router       *mux.Router
+	config       *config.Config
+	vdbClient    *weaviate.Client
+	httpServer   *http.Server
+	embeddingDim int
 }
 
 // NewServer creates a new API server
-func NewServer(cfg *config.Config, qdrantClient *qdrant.Client, embeddingService embed.EmbeddingService) *Server {
-	router := chi.NewRouter()
+func NewServer(cfg *config.Config, embeddingDim int) (*Server, error) {
+	// Initialize the vector database client
+	vdbClient, err := weaviate.NewClient(cfg, embeddingDim)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create vector database client: %w", err)
+	}
 
-	// Create match service
-	matchService := match.NewService(cfg, qdrantClient, embeddingService)
+	// Initialize the router
+	router := mux.NewRouter()
 
+	// Create the server
 	server := &Server{
-		router:           router,
-		matchService:     matchService,
-		config:           cfg,
-		qdrantClient:     qdrantClient,
-		embeddingService: embeddingService,
+		router:       router,
+		config:       cfg,
+		vdbClient:    vdbClient,
+		embeddingDim: embeddingDim,
 	}
 
-	// Set up middleware
-	router.Use(middleware.RequestID)
-	router.Use(middleware.RealIP)
-	router.Use(middleware.Logger)
-	router.Use(middleware.Recoverer)
-	router.Use(middleware.Timeout(30 * time.Second))
+	// Register routes
+	server.registerRoutes()
 
-	// Set up routes
-	router.Get("/", server.handleIndex)
-	router.Get("/health", server.handleHealth)
-
-	router.Route("/api", func(r chi.Router) {
-		r.Post("/match", server.handleMatch)
-		r.Post("/ingest", server.handleIngest)
-		r.Get("/stats", server.handleStats)
-	})
-
-	return server
+	return server, nil
 }
 
-// Start starts the HTTP server
-func (s *Server) Start(port int) error {
-	addr := fmt.Sprintf(":%d", port)
-	log.Printf("Starting API server on %s", addr)
-	return http.ListenAndServe(addr, s.router)
+// registerRoutes registers all API routes
+func (s *Server) registerRoutes() {
+	// Health check endpoint
+	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
+
+	// Entity endpoints
+	s.router.HandleFunc("/entities", s.handleGetEntities).Methods("GET")
+	s.router.HandleFunc("/entities", s.handleAddEntity).Methods("POST")
+	s.router.HandleFunc("/entities/{id}", s.handleGetEntity).Methods("GET")
+	s.router.HandleFunc("/entities/{id}", s.handleUpdateEntity).Methods("PUT")
+	s.router.HandleFunc("/entities/{id}", s.handleDeleteEntity).Methods("DELETE")
+	s.router.HandleFunc("/entities/batch", s.handleBatchAddEntities).Methods("POST")
+	s.router.HandleFunc("/entities/count", s.handleGetEntityCount).Methods("GET")
+
+	// Matching endpoints
+	s.router.HandleFunc("/match", s.handleMatchEntity).Methods("POST")
 }
 
-// handleIndex handles the root route
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"name":    "Resolve Entity Matching API",
-		"version": "1.0.0",
-	})
+// Start starts the API server
+func (s *Server) Start() error {
+	// Create the HTTP server
+	s.httpServer = &http.Server{
+		Addr:         fmt.Sprintf("%s:%d", s.config.API.Host, s.config.API.Port),
+		Handler:      s.router,
+		ReadTimeout:  time.Duration(s.config.API.ReadTimeoutSecs) * time.Second,
+		WriteTimeout: time.Duration(s.config.API.WriteTimeoutSecs) * time.Second,
+		IdleTimeout:  time.Duration(s.config.API.IdleTimeoutSecs) * time.Second,
+	}
+
+	// Start the server
+	log.Printf("Starting API server on %s:%d", s.config.API.Host, s.config.API.Port)
+	return s.httpServer.ListenAndServe()
 }
 
-// handleHealth handles the health check route
+// Shutdown gracefully shuts down the API server
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s.httpServer != nil {
+		return s.httpServer.Shutdown(ctx)
+	}
+	return nil
+}
+
+// Health check handler
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	// Check Qdrant health
-	qdrantVersion, err := s.qdrantClient.Health(ctx)
-	qdrantHealth := "ok"
+	// Check vector database health
+	vdbHealth, err := s.vdbClient.Health(r.Context())
 	if err != nil {
-		qdrantHealth = fmt.Sprintf("error: %v", err)
+		respondWithError(w, http.StatusInternalServerError, "Vector database health check failed: "+err.Error())
+		return
 	}
 
-	// Prepare response
-	response := map[string]interface{}{
-		"status": "ok",
-		"components": map[string]string{
-			"qdrant":         qdrantHealth,
-			"qdrant_version": qdrantVersion,
-		},
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	// Return health status
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"status":      "ok",
+		"vdb_healthy": vdbHealth,
+		"timestamp":   timeNow().Format(timeFormat),
+	})
 }
 
-// handleMatch handles entity matching requests
-func (s *Server) handleMatch(w http.ResponseWriter, r *http.Request) {
+// Entity handlers
+
+// handleGetEntities handles GET /entities
+func (s *Server) handleGetEntities(w http.ResponseWriter, r *http.Request) {
+	// Not implemented yet - will require pagination and possibly filtering
+	respondWithError(w, http.StatusNotImplemented, "Get all entities is not implemented")
+}
+
+// handleAddEntity handles POST /entities
+func (s *Server) handleAddEntity(w http.ResponseWriter, r *http.Request) {
 	// Parse request
-	var req MatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, "Invalid request format", http.StatusBadRequest)
+	var entity weaviate.EntityRecord
+	if err := json.NewDecoder(r.Body).Decode(&entity); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload: "+err.Error())
 		return
 	}
 
-	// Validate request
-	if req.Text == "" {
-		s.sendError(w, "Text is required", http.StatusBadRequest)
+	// Check if vector is provided
+	if len(entity.Vector) == 0 {
+		respondWithError(w, http.StatusBadRequest, "Entity vector is required")
 		return
 	}
 
-	// Set default values
-	if req.Limit <= 0 {
-		req.Limit = 10
+	// Check vector dimension
+	if len(entity.Vector) != s.embeddingDim {
+		respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Invalid vector dimension: expected %d, got %d", s.embeddingDim, len(entity.Vector)))
+		return
 	}
 
-	if req.Threshold <= 0 {
-		req.Threshold = s.config.SimilarityThreshold
-	}
-
-	// Create options
-	opts := match.Options{
-		Limit:          req.Limit,
-		Threshold:      req.Threshold,
-		IncludeDetails: req.IncludeDetails,
-	}
-
-	// Execute search
-	matches, err := s.matchService.FindMatches(r.Context(), req.Text, opts)
+	// Add entity
+	id, err := s.vdbClient.AddEntity(r.Context(), &entity)
 	if err != nil {
-		s.sendError(w, fmt.Sprintf("Search failed: %v", err), http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to add entity: "+err.Error())
 		return
 	}
 
-	// Send response
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(matches)
+	// Return success response
+	respondWithJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
 
-// handleIngest handles entity ingestion requests
-func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
+// handleGetEntity handles GET /entities/{id}
+func (s *Server) handleGetEntity(w http.ResponseWriter, r *http.Request) {
+	// Get ID from path
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	// Get entity
+	entity, err := s.vdbClient.GetEntity(r.Context(), id)
+	if err != nil {
+		respondWithError(w, http.StatusNotFound, "Entity not found: "+err.Error())
+		return
+	}
+
+	// Return entity
+	respondWithJSON(w, http.StatusOK, entity)
+}
+
+// handleUpdateEntity handles PUT /entities/{id}
+func (s *Server) handleUpdateEntity(w http.ResponseWriter, r *http.Request) {
+	// Get ID from path
+	vars := mux.Vars(r)
+	id := vars["id"]
+
 	// Parse request
-	var req IngestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.sendError(w, "Invalid request format", http.StatusBadRequest)
+	var entity weaviate.EntityRecord
+	if err := json.NewDecoder(r.Body).Decode(&entity); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload: "+err.Error())
 		return
 	}
 
-	// Validate request
-	if len(req.Entities) == 0 {
-		s.sendError(w, "No entities provided", http.StatusBadRequest)
+	// Set ID from path
+	entity.ID = id
+
+	// Check vector dimension if provided
+	if len(entity.Vector) > 0 && len(entity.Vector) != s.embeddingDim {
+		respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Invalid vector dimension: expected %d, got %d", s.embeddingDim, len(entity.Vector)))
 		return
 	}
 
-	// Ingest entities
-	err := s.matchService.AddEntities(r.Context(), req.Entities)
+	// Update entity
+	err := s.vdbClient.UpdateEntity(r.Context(), &entity)
 	if err != nil {
-		s.sendError(w, fmt.Sprintf("Ingestion failed: %v", err), http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to update entity: "+err.Error())
 		return
 	}
 
-	// Send response
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":   "success",
-		"ingested": len(req.Entities),
+	// Return success response
+	respondWithJSON(w, http.StatusOK, map[string]string{"status": "updated", "id": id})
+}
+
+// handleDeleteEntity handles DELETE /entities/{id}
+func (s *Server) handleDeleteEntity(w http.ResponseWriter, r *http.Request) {
+	// Get ID from path
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	// Delete entity
+	err := s.vdbClient.DeleteEntity(r.Context(), id)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to delete entity: "+err.Error())
+		return
+	}
+
+	// Return success response
+	respondWithJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": id})
+}
+
+// handleBatchAddEntities handles POST /entities/batch
+func (s *Server) handleBatchAddEntities(w http.ResponseWriter, r *http.Request) {
+	// Parse request
+	var request struct {
+		Entities []*weaviate.EntityRecord `json:"entities"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload: "+err.Error())
+		return
+	}
+
+	// Check if entities are provided
+	if len(request.Entities) == 0 {
+		respondWithError(w, http.StatusBadRequest, "No entities provided")
+		return
+	}
+
+	// Check vector dimensions
+	for i, entity := range request.Entities {
+		if len(entity.Vector) == 0 {
+			respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Entity at index %d has no vector", i))
+			return
+		}
+		if len(entity.Vector) != s.embeddingDim {
+			respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Entity at index %d has invalid vector dimension: expected %d, got %d", i, s.embeddingDim, len(entity.Vector)))
+			return
+		}
+	}
+
+	// Add entities in batch
+	ids, err := s.vdbClient.BatchAddEntities(r.Context(), request.Entities)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to add entities in batch: "+err.Error())
+		return
+	}
+
+	// Return success response
+	respondWithJSON(w, http.StatusCreated, map[string]interface{}{
+		"status": "added",
+		"count":  len(ids),
+		"ids":    ids,
 	})
 }
 
-// handleStats handles stats requests
-func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	// Get entity count
-	count, err := s.matchService.GetEntityCount(ctx)
+// handleGetEntityCount handles GET /entities/count
+func (s *Server) handleGetEntityCount(w http.ResponseWriter, r *http.Request) {
+	// Get count
+	count, err := s.vdbClient.GetCount(r.Context())
 	if err != nil {
-		s.sendError(w, fmt.Sprintf("Failed to get stats: %v", err), http.StatusInternalServerError)
+		respondWithError(w, http.StatusInternalServerError, "Failed to get entity count: "+err.Error())
 		return
 	}
 
-	// Send response
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"entity_count": count,
+	// Return count
+	respondWithJSON(w, http.StatusOK, map[string]int{"count": count})
+}
+
+// Matching handlers
+
+// handleMatchEntity handles POST /match
+func (s *Server) handleMatchEntity(w http.ResponseWriter, r *http.Request) {
+	// Parse request
+	var request MatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload: "+err.Error())
+		return
+	}
+
+	// Set defaults
+	if request.Threshold <= 0 {
+		request.Threshold = 0.7 // Default threshold
+	}
+	if request.Limit <= 0 {
+		request.Limit = 10 // Default limit
+	}
+
+	// Check if entity and vector are provided
+	if request.Entity == nil {
+		respondWithError(w, http.StatusBadRequest, "Entity is required")
+		return
+	}
+	if len(request.Entity.Vector) == 0 {
+		respondWithError(w, http.StatusBadRequest, "Entity vector is required")
+		return
+	}
+
+	// Check vector dimension
+	if len(request.Entity.Vector) != s.embeddingDim {
+		respondWithError(w, http.StatusBadRequest, fmt.Sprintf("Invalid vector dimension: expected %d, got %d", s.embeddingDim, len(request.Entity.Vector)))
+		return
+	}
+
+	// Find matches
+	matches, err := s.vdbClient.FindMatches(r.Context(), request.Entity, request.Threshold, request.Limit)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to find matches: "+err.Error())
+		return
+	}
+
+	// Return matches
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"matches": matches,
+		"count":   len(matches),
 	})
 }
 
-// sendError sends an error response
-func (s *Server) sendError(w http.ResponseWriter, message string, statusCode int) {
+// Response helpers
+
+// respondWithError responds with an error
+func respondWithError(w http.ResponseWriter, code int, message string) {
+	respondWithJSON(w, code, map[string]string{"error": message})
+}
+
+// respondWithJSON responds with JSON
+func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	// Create response
+	response, err := json.Marshal(payload)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"Failed to marshal JSON response"}`))
+		return
+	}
+
+	// Set headers
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(ErrorResponse{
-		Error: message,
-	})
+	w.WriteHeader(code)
+	w.Write(response)
 }

@@ -1,0 +1,172 @@
+[
+  {
+    "id": "entity-001",
+    "fields": {
+      "name": "Acme Corporation",
+      "address": "123 Main Street",
+      "city": "New York",
+      "state": "NY",
+      "zip": "10001",
+      "phone": "+1 (555) 123-4567",
+      "email": "info@acme.com"
+    },
+    "metadata": {
+      "source": "CRM",
+      "customer_since": "2020-01-01",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-002",
+    "fields": {
+      "name": "Acme Corp.",
+      "address": "123 Main St",
+      "city": "New York",
+      "state": "New York",
+      "zip": "10001",
+      "phone": "555-123-4567",
+      "email": "contact@acme.com"
+    },
+    "metadata": {
+      "source": "Website",
+      "customer_since": "2020-02-15",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-003",
+    "fields": {
+      "name": "Globex Corporation",
+      "address": "456 Park Avenue",
+      "city": "Boston",
+      "state": "MA",
+      "zip": "02108",
+      "phone": "+1 (555) 987-6543",
+      "email": "info@globex.com"
+    },
+    "metadata": {
+      "source": "Sales",
+      "customer_since": "2019-06-10",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-004",
+    "fields": {
+      "name": "Soylent Corp",
+      "address": "789 Broadway",
+      "city": "San Francisco",
+      "state": "CA",
+      "zip": "94107",
+      "phone": "+1-555-789-0123",
+      "email": "contact@soylent.com"
+    },
+    "metadata": {
+      "source": "Marketing",
+      "customer_since": "2021-03-22",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-005",
+    "fields": {
+      "name": "Umbrella Corporation",
+      "address": "444 Elm Street",
+      "city": "Chicago",
+      "state": "IL",
+      "zip": "60601",
+      "phone": "(555) 456-7890",
+      "email": "info@umbrella.com"
+    },
+    "metadata": {
+      "source": "CRM",
+      "customer_since": "2018-11-30",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-006",
+    "fields": {
+      "name": "John Smith",
+      "address": "101 Oak Drive",
+      "city": "Dallas",
+      "state": "TX",
+      "zip": "75201",
+      "phone": "+1 (555) 222-3333",
+      "email": "john.smith@example.com"
+    },
+    "metadata": {
+      "source": "CRM",
+      "customer_since": "2019-08-15",
+      "type": "individual"
+    }
+  },
+  {
+    "id": "entity-007",
+    "fields": {
+      "name": "Jane Doe",
+      "address": "202 Maple Lane",
+      "city": "Seattle",
+      "state": "WA",
+      "zip": "98101",
+      "phone": "555-444-5555",
+      "email": "jane.doe@example.com"
+    },
+    "metadata": {
+      "source": "Website",
+      "customer_since": "2020-05-20",
+      "type": "individual"
+    }
+  },
+  {
+    "id": "entity-008",
+    "fields": {
+      "name": "Stark Industries",
+      "address": "10880 Malibu Point",
+      "city": "Malibu",
+      "state": "CA",
+      "zip": "90265",
+      "phone": "+1 (555) 888-9999",
+      "email": "info@stark.com"
+    },
+    "metadata": {
+      "source": "Sales",
+      "customer_since": "2017-04-18",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-009",
+    "fields": {
+      "name": "Wayne Enterprises",
+      "address": "1007 Mountain Drive",
+      "city": "Gotham",
+      "state": "NJ",
+      "zip": "07001",
+      "phone": "(555) 777-6666",
+      "email": "contact@wayne.com"
+    },
+    "metadata": {
+      "source": "CRM",
+      "customer_since": "2016-09-23",
+      "type": "business"
+    }
+  },
+  {
+    "id": "entity-010",
+    "fields": {
+      "name": "Oscorp Industries",
+      "address": "567 Fifth Avenue",
+      "city": "New York",
+      "state": "NY",
+      "zip": "10022",
+      "phone": "+1-555-111-2222",
+      "email": "info@oscorp.com"
+    },
+    "metadata": {
+      "source": "Marketing",
+      "customer_since": "2018-02-14",
+      "type": "business"
+    }
+  }
+] 
