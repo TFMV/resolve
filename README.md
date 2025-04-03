@@ -197,7 +197,7 @@ The main model for storing entity information:
   "email_normalized": "info@acme.com",
   "created_at": 1649955600,
   "updated_at": 1649955600,
-  "vector": [0.1, 0.2, ...],
+  "vector": [0.1, 0.2],
   "metadata": {
     "source": "CRM",
     "type": "business"
@@ -215,7 +215,7 @@ The model for entity matching results:
     "id": "entity-001",
     "name": "Acme Corporation",
     "address": "123 Main St",
-    "vector": [0.1, 0.2, ...],
+    "vector": [0.1, 0.2],
     "metadata": {}
   },
   "score": 0.92,
