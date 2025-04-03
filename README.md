@@ -1,4 +1,4 @@
-# Resolve: High-Performance Entity Matching System
+# Resolve
 
 Resolve is an approximate entity matching system written in Go. It matches customer and business entities across multiple dimensions (name, address, city, state, zip, phone, email) to unify fragmented records across data silos, identifying semantically similar entities even when data is messy, incomplete, or inconsistent.
 
@@ -42,11 +42,7 @@ Resolve follows a layered architecture:
 ### 1. Install Dependencies
 
 ```bash
-go get github.com/gorilla/mux
-go get github.com/spf13/viper
-go get github.com/google/uuid
-go get github.com/weaviate/weaviate-go-client/v4
-go mod download
+go mod tidy
 ```
 
 ### 2. Configure Vector Database
@@ -64,15 +60,7 @@ docker run -d --name weaviate-resolve \
 
 ### 3. Set Up Embedding Service
 
-Set up an embedding service that can generate vectors for your entity text:
-
-```bash
-# Example using a sentence-transformers based service
-git clone https://github.com/example/embedding-service.git
-cd embedding-service
-pip install -r requirements.txt
-python server.py
-```
+Set up an embedding service that can generate vectors for your entity text.
 
 ### 4. Configure Resolve
 
@@ -319,4 +307,4 @@ normalization:
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the [MIT License](LICENSE).
