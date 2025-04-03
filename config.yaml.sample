@@ -1,0 +1,66 @@
+# Resolve Sample Configuration
+
+# Server configuration
+server:
+  port: 8080
+
+# API configuration
+api:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout_secs: 30
+  write_timeout_secs: 30
+  idle_timeout_secs: 60
+
+# Weaviate configuration
+weaviate:
+  host: "localhost:8080"
+  scheme: "http"
+  api_key: ""
+  class_name: "Entity"
+
+# Embedding service configuration
+embedding:
+  url: "http://localhost:8000"
+  batch_size: 32
+  timeout: 30
+  cache_size: 1000
+  model_name: "all-MiniLM-L6-v2"  # The model used by the embedding service
+  embedding_dim: 384             # Vector dimension of the model
+
+# Matching configuration
+matching:
+  similarity_threshold: 0.85     # Default threshold for match results (0.0-1.0)
+  default_limit: 10              # Default number of results to return
+  field_weights:                 # Weights for each field when calculating match scores
+    name: 0.4
+    address: 0.2
+    city: 0.1
+    state: 0.05
+    zip: 0.05
+    phone: 0.1
+    email: 0.1
+
+# Normalization configuration
+normalization:
+  enable_stopwords: true          # Remove common stopwords
+  enable_stemming: true           # Apply stemming to words
+  enable_lowercase: true          # Convert text to lowercase
+  
+  # Name normalization options
+  name_options:
+    remove_legal_suffixes: true    # Remove "Inc.", "LLC", etc.
+    normalize_initials: true       # Standardize initials
+  
+  # Address normalization options
+  address_options:
+    standardize_abbreviations: true  # Convert "Street" to "St", etc.
+    remove_apartment_numbers: true   # Remove apt/suite numbers
+  
+  # Phone normalization options
+  phone_options:
+    e164_format: true              # Convert to E.164 format
+  
+  # Email normalization options
+  email_options:
+    lowercase_domain: true         # Convert domain to lowercase 
