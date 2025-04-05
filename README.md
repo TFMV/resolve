@@ -1,37 +1,79 @@
 # Resolve
 
-Resolve is an approximate entity matching system written in Go. It matches customer and business entities across multiple dimensions (name, address, city, state, zip, phone, email) to unify fragmented records across data silos, identifying semantically similar entities even when data is messy, incomplete, or inconsistent.
+Resolve is a powerful entity matching system written in Go that provides high-precision entity resolution through semantic similarity and field-specific matching intelligence. It unifies fragmented records across data silos by identifying semantically similar entities even when data is messy, incomplete, or inconsistent.
 
 ## Features
 
 - Semantic similarity using vector embeddings
-- Configurable attribute weighting
-- Multi-field matching with tunable thresholds
-- Support for batch operations and real-time lookups
-- Customizable normalization pipeline
+- Field-specific similarity functions optimized for names, addresses, phones, emails, etc.
+- Customizable attribute weighting and scoring
+- Match groups with transitive closure support
+- Multi-strategy blocking and clustering for performance
+- Detailed match explanations and confidence scoring
+- Configurable normalization pipeline
 - Both CLI and API interfaces
+- Production-ready performance for large datasets
 
 ## Architecture
 
-![Architecture](art/arch.png)
+```mermaid
+graph TD
+    subgraph "Client Interfaces"
+        CLI[Command Line Interface]
+        API[HTTP API]
+    end
 
-Resolve follows a layered architecture:
+    subgraph "Application Layer"
+        MS[Match Service]
+        GS[Group Service]
+        NS[Normalization Service]
+        CS[Clustering Service]
+    end
 
-1. **Data Access Layer**
-   - Vector database client for storage and retrieval (currently supporting Weaviate)
-   - Embedding service client for vector generation
-   - Configuration loader for system parameters
+    subgraph "Core Processing"
+        ES[Embedding Service]
+        SS[Similarity Service]
+    end
 
-2. **Core Processing Layer**
-   - Normalization engine for text preprocessing
-   - Entity transformation pipeline
-   - Embedding generation and caching
-   - Vector search and ranking
+    subgraph "Data Layer"
+        VC[Vector Database Client]
+        EC[Embedding Cache]
+    end
 
-3. **Application Layer**
-   - HTTP API for entity operations and matching
-   - CLI for batch processing
-   - Result formatting and explanation
+    CLI --> MS
+    API --> MS
+    API --> GS
+    MS --> NS
+    MS --> ES
+    MS --> SS
+    MS --> CS
+    MS --> VC
+    GS --> MS
+    CS --> VC
+    ES --> EC
+    ES --> VC
+    SS --> NS
+```
+
+Resolve follows a modular, layered architecture:
+
+1. **Client Interfaces**
+   - HTTP API for entity operations, matching, and grouping
+   - CLI for batch processing and maintenance tasks
+
+2. **Application Layer**
+   - Match Service orchestrates the matching process
+   - Group Service manages match groups and transitive closure
+   - Normalization Service standardizes entity fields
+   - Clustering Service partitions data for efficient retrieval
+
+3. **Core Processing Layer**
+   - Embedding Service generates vector representations
+   - Similarity Service provides field-specific comparison functions
+
+4. **Data Layer**
+   - Vector Database Client for storage and search (Weaviate)
+   - Embedding Cache for performance optimization
 
 ## Prerequisites
 
@@ -76,6 +118,27 @@ Edit `config.yaml` to set up your Weaviate connection, API server settings, and 
 
 ## Usage
 
+### Command Line Interface
+
+Resolve provides a CLI for batch operations and maintenance tasks:
+
+```bash
+# Ingest entities from a JSON file
+resolve --ingest entities.json
+
+# Match an entity from a JSON file
+resolve --match-file query.json --threshold 0.8 --limit 5 --field-scores
+
+# Match a string query
+resolve --match "Acme Corporation" --threshold 0.7
+
+# Recompute clusters for all entities
+resolve --recompute-clusters
+
+# Find a match group for an entity
+resolve --group entity-123 --group-strategy transitive --group-hops 3
+```
+
 ### API Server
 
 Start the API server:
@@ -100,14 +163,20 @@ curl http://localhost:8080/health
 curl -X POST http://localhost:8080/entities \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Acme Corporation",
-    "address": "123 Main St",
-    "city": "New York",
-    "state": "NY",
-    "zip": "10001",
-    "phone": "+1 555-123-4567",
-    "email": "info@acme.com",
-    "vector": [0.1, 0.2, ... ] 
+    "id": "entity-001",
+    "fields": {
+      "name": "Acme Corporation",
+      "address": "123 Main St",
+      "city": "New York",
+      "state": "NY",
+      "zip": "10001",
+      "phone": "+1 555-123-4567",
+      "email": "info@acme.com"
+    },
+    "metadata": {
+      "source": "CRM",
+      "type": "business"
+    }
   }'
 ```
 
@@ -123,8 +192,10 @@ curl http://localhost:8080/entities/{id}
 curl -X PUT http://localhost:8080/entities/{id} \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Acme Corp Updated",
-    "vector": [0.1, 0.2, ... ]
+    "fields": {
+      "name": "Acme Corp Updated",
+      "address": "456 New St"
+    }
   }'
 ```
 
@@ -142,12 +213,16 @@ curl -X POST http://localhost:8080/entities/batch \
   -d '{
     "entities": [
       {
-        "name": "Entity 1",
-        "vector": [0.1, 0.2, ... ]
+        "fields": {
+          "name": "Entity 1",
+          "address": "123 First St"
+        }
       },
       {
-        "name": "Entity 2",
-        "vector": [0.3, 0.4, ... ]
+        "fields": {
+          "name": "Entity 2",
+          "address": "456 Second St"
+        }
       }
     ]
   }'
@@ -161,114 +236,165 @@ curl http://localhost:8080/entities/count
 
 #### Entity Matching
 
+1. **Match an entity:**
+
 ```bash
 curl -X POST http://localhost:8080/match \
   -H "Content-Type: application/json" \
   -d '{
     "entity": {
-      "name": "Acme Corp",
-      "vector": [0.1, 0.2, ... ]
+      "fields": {
+        "name": "Acme Corp",
+        "address": "123 Main St"
+      }
     },
     "threshold": 0.7,
-    "limit": 10
+    "limit": 10,
+    "include_field_scores": true,
+    "use_clustering": true
   }'
 ```
 
-## Clustering
+2. **Match by text:**
 
-Resolve now supports clustering for faster candidate retrieval, implementing a similar approach to Zingg's blocking functionality. Clustering allows Resolve to pre-filter candidates before performing fine-grained vector similarity matching, significantly improving performance for large datasets.
+```bash
+curl -X POST http://localhost:8080/match/text \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Acme Corporation in New York",
+    "threshold": 0.7,
+    "limit": 10,
+    "include_field_scores": true
+  }'
+```
+
+3. **Find match group:**
+
+```bash
+curl -X GET http://localhost:8080/match/group/{entity_id}?strategy=transitive&hops=2&threshold=0.8
+```
+
+4. **Recompute clusters:**
+
+```bash
+curl -X POST http://localhost:8080/clusters/recompute
+```
+
+## Field-Specific Similarity Functions
+
+Resolve implements specialized similarity functions for different field types:
+
+- **Name Comparison**: Uses specialized algorithms for business names and person names
+- **Address Comparison**: Intelligent comparison accounting for abbreviations and formatting
+- **Phone Comparison**: Digit-based comparison ignoring formatting differences
+- **Email Comparison**: Domain-weighted matching with special handling for common patterns
+- **Zip/Postal Code**: Prefix matching with graduated confidence
+- **General Text**: Fallback to general-purpose string similarity algorithms
+
+Each field is analyzed with the appropriate similarity function, providing more accurate field-level matching than generic string comparison.
+
+## Match Groups & Transitive Closure
+
+Resolve supports finding connected entities through both direct and transitive relationships:
+
+### Direct Matching
+
+Finds entities that directly match the query entity based on the similarity threshold.
+
+### Transitive Matching
+
+Uses graph traversal to find entities connected through intermediate matches. For example, if A matches B and B matches C, then A and C are transitively connected even if they don't directly match.
+
+### Hybrid Matching
+
+Combines direct and limited transitive matching for balanced results, using adjusted thresholds and hop limits.
+
+Group retrieval options include:
+
+- Strategy (direct, transitive, hybrid)
+- Maximum hops for transitive matching
+- Threshold overrides
+- Maximum group size
+- Field weights for scoring
+
+## Clustering for Performance
+
+Resolve implements a clustering system for efficient candidate retrieval, similar to blocking in traditional entity resolution systems:
 
 ### How Clustering Works
 
-The clustering implementation uses a "canopy" approach:
-
-1. **Blocking key generation**: For each entity, Resolve extracts features from specified fields (e.g., first 3 characters of name, zip code prefix) to create a composite blocking key.
-2. **Cluster ID assignment**: Each entity is assigned to a cluster based on its blocking key.
-3. **Filtered matching**: When matching, Resolve first finds the query entity's cluster, then performs vector similarity search primarily within that cluster.
-4. **Fallback mechanism**: If no matches are found within the cluster, Resolve falls back to a global search.
-
-### Configuration
+1. **Blocking key generation**: Extracts features from specified fields to create a composite blocking key
+2. **Cluster ID assignment**: Assigns entities to clusters based on blocking keys
+3. **Filtered matching**: First searches within the query entity's cluster
+4. **Fallback mechanism**: Falls back to global search if needed
 
 Configure clustering in the `config.yaml` file:
 
 ```yaml
 clustering:
-  enabled: true                  # Enable/disable clustering
-  method: "canopy"               # Currently only "canopy" is supported
-  fields:                        # Fields to use for blocking/clustering
+  enabled: true
+  method: "canopy"
+  fields:
     - "name"
     - "zip"
-  similarity_threshold: 0.8      # Threshold for clustering (for future methods)
+  similarity_threshold: 0.8
 ```
 
-### CLI Commands
+## Enhanced Match Results
 
-After configuring clustering, you can recompute clusters for all existing entities:
-
-```bash
-resolve --recompute-clusters
-```
-
-This is useful when:
-
-- You enable clustering for the first time with an existing database
-- You change the clustering configuration (e.g., adding new fields)
-- You want to force a rebuild of all clusters
-
-### API Endpoints
-
-Resolve provides an API endpoint for cluster maintenance:
-
-```
-POST /clusters/recompute
-```
-
-This endpoint triggers an asynchronous recomputation of all clusters and returns immediately with a 202 status.
-
-The match endpoint supports a new parameter `use_clustering` to control whether clustering should be used for a specific query:
-
-```json
-{
-  "entity": { ... },
-  "threshold": 0.85,
-  "limit": 10,
-  "use_clustering": true
-}
-```
-
-### Performance Considerations
-
-- Clustering is most beneficial for datasets with >10,000 entities
-- The optimal clustering fields depend on your data characteristics
-- Name and zip/postal code are generally effective clustering fields
-- Monitor performance with and without clustering for your specific use case
-
-## Data Models
-
-### EntityRecord
-
-The main model for storing entity information:
+Match results now include detailed field-level scoring:
 
 ```json
 {
   "id": "entity-001",
-  "name": "Acme Corporation",
-  "name_normalized": "acme corporation",
-  "address": "123 Main St",
-  "address_normalized": "123 main st",
-  "city": "New York",
-  "city_normalized": "new york",
-  "state": "NY",
-  "state_normalized": "ny",
-  "zip": "10001",
-  "zip_normalized": "10001",
-  "phone": "+1 555-123-4567",
-  "phone_normalized": "+15551234567",
-  "email": "info@acme.com",
-  "email_normalized": "info@acme.com",
-  "created_at": 1649955600,
-  "updated_at": 1649955600,
-  "vector": [0.1, 0.2],
+  "score": 0.92,
+  "fields": {
+    "name": "Acme Corporation",
+    "address": "123 Main St"
+  },
+  "matched_on": ["name", "address"],
+  "explanation": "Matched with high confidence (0.92) on fields: name, address",
+  "field_scores": {
+    "name": {
+      "score": 0.95,
+      "query_value": "acme corp",
+      "matched_value": "acme corporation",
+      "similarity_function": "Name",
+      "normalized": true
+    },
+    "address": {
+      "score": 0.89,
+      "query_value": "123 main street",
+      "matched_value": "123 main st",
+      "similarity_function": "Address",
+      "normalized": true
+    }
+  },
+  "metadata": {
+    "source": "CRM",
+    "created_at": 1649955600
+  }
+}
+```
+
+## Data Models
+
+### EntityData
+
+The model for representing entity information:
+
+```json
+{
+  "id": "entity-001",
+  "fields": {
+    "name": "Acme Corporation",
+    "address": "123 Main St",
+    "city": "New York",
+    "state": "NY",
+    "zip": "10001",
+    "phone": "+1 555-123-4567",
+    "email": "info@acme.com"
+  },
   "metadata": {
     "source": "CRM",
     "type": "business"
@@ -282,22 +408,63 @@ The model for entity matching results:
 
 ```json
 {
-  "entity": {
-    "id": "entity-001",
-    "name": "Acme Corporation",
-    "address": "123 Main St",
-    "vector": [0.1, 0.2],
-    "metadata": {}
-  },
+  "id": "entity-001",
   "score": 0.92,
-  "distance": 0.08,
-  "match_id": "entity-001",
-  "matched_on": ["vector"],
-  "explanation": "Vector similarity score: 0.92",
-  "field_scores": {
-    "vector": 0.92
+  "fields": {
+    "name": "Acme Corporation",
+    "address": "123 Main St"
   },
-  "metadata": {}
+  "matched_on": ["name", "address"],
+  "explanation": "Matched with high confidence (0.92) on fields: name, address",
+  "field_scores": {
+    "name": {
+      "score": 0.95,
+      "similarity_function": "Name"
+    },
+    "address": {
+      "score": 0.89,
+      "similarity_function": "Address"
+    }
+  },
+  "metadata": {
+    "source": "CRM",
+    "created_at": 1649955600
+  }
+}
+```
+
+### MatchGroup
+
+The model for entity match groups:
+
+```json
+{
+  "group_id": "group-001",
+  "size": 3,
+  "average_score": 0.87,
+  "primary_entity": "entity-001",
+  "entities": [
+    {
+      "id": "entity-001",
+      "score": 1.0,
+      "fields": { ... }
+    },
+    {
+      "id": "entity-002",
+      "score": 0.92,
+      "fields": { ... }
+    },
+    {
+      "id": "entity-003",
+      "score": 0.78,
+      "fields": { ... }
+    }
+  ],
+  "field_agreement": {
+    "name": 0.95,
+    "address": 0.82,
+    "phone": 0.67
+  }
 }
 ```
 
@@ -374,6 +541,18 @@ normalization:
     e164_format: true
   email_options:
     lowercase_domain: true
+```
+
+### Clustering Configuration
+
+```yaml
+clustering:
+  enabled: true
+  method: "canopy"
+  fields:
+    - "name"
+    - "zip"
+  similarity_threshold: 0.8
 ```
 
 ## License

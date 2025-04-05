@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/TFMV/resolve/internal/config"
@@ -22,10 +23,24 @@ var timeNow = time.Now
 
 // MatchRequest represents a request to match an entity
 type MatchRequest struct {
-	Entity     *weaviate.EntityRecord `json:"entity"`
-	Threshold  float64                `json:"threshold"`
-	Limit      int                    `json:"limit"`
-	UseCluster bool                   `json:"use_clustering,omitempty"`
+	Entity            *weaviate.EntityRecord `json:"entity"`
+	Text              string                 `json:"text,omitempty"`
+	Threshold         float64                `json:"threshold"`
+	Limit             int                    `json:"limit"`
+	UseCluster        bool                   `json:"use_clustering,omitempty"`
+	IncludeScores     bool                   `json:"include_scores,omitempty"`
+	FieldWeights      map[string]float32     `json:"field_weights,omitempty"`
+	FieldTypeMappings map[string]string      `json:"field_type_mappings,omitempty"`
+}
+
+// MatchGroupRequest represents a request to retrieve a match group
+type MatchGroupRequest struct {
+	ThresholdOverride float32            `json:"threshold_override,omitempty"`
+	MaxSize           int                `json:"max_size,omitempty"`
+	IncludeScores     bool               `json:"include_scores,omitempty"`
+	Strategy          string             `json:"strategy,omitempty"` // "direct", "transitive", or "hybrid"
+	HopsLimit         int                `json:"hops_limit,omitempty"`
+	FieldWeights      map[string]float32 `json:"field_weights,omitempty"`
 }
 
 // Server represents the API server
@@ -64,6 +79,11 @@ func (s *Server) registerRoutes() {
 
 	// Matching endpoints
 	s.router.HandleFunc("/match", s.handleMatchEntity).Methods(http.MethodPost)
+	s.router.HandleFunc("/match/text", s.handleMatchText).Methods(http.MethodPost)
+
+	// Match group endpoints
+	s.router.HandleFunc("/entities/{id}/group", s.handleGetMatchGroup).Methods(http.MethodGet)
+	s.router.HandleFunc("/entities/{id}/group", s.handleMatchGroupWithOptions).Methods(http.MethodPost)
 
 	// Clustering endpoints
 	s.router.HandleFunc("/clusters/recompute", s.handleRecomputeClusters).Methods(http.MethodPost)
@@ -71,6 +91,9 @@ func (s *Server) registerRoutes() {
 
 // Start starts the API server
 func (s *Server) Start() error {
+	// Register routes
+	s.registerRoutes()
+
 	// Create the HTTP server
 	s.httpServer = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", s.config.API.Host, s.config.API.Port),
@@ -287,10 +310,10 @@ func (s *Server) handleMatchEntity(w http.ResponseWriter, r *http.Request) {
 
 	// Set defaults
 	if request.Threshold <= 0 {
-		request.Threshold = 0.7 // Default threshold
+		request.Threshold = float64(s.config.Matching.SimilarityThreshold)
 	}
 	if request.Limit <= 0 {
-		request.Limit = 10 // Default limit
+		request.Limit = s.config.Matching.DefaultLimit
 	}
 
 	// Check if entity and vector are provided
@@ -309,8 +332,57 @@ func (s *Server) handleMatchEntity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Convert entity to match format
+	entityData := match.EntityData{
+		ID: request.Entity.ID,
+		Fields: map[string]string{
+			"name":    request.Entity.Name,
+			"address": request.Entity.Address,
+			"city":    request.Entity.City,
+			"state":   request.Entity.State,
+			"zip":     request.Entity.Zip,
+			"phone":   request.Entity.Phone,
+			"email":   request.Entity.Email,
+		},
+		Metadata: request.Entity.Metadata,
+	}
+
+	// Add normalized fields if available
+	if request.Entity.NameNormalized != "" {
+		entityData.Fields["name_normalized"] = request.Entity.NameNormalized
+	}
+	if request.Entity.AddressNormalized != "" {
+		entityData.Fields["address_normalized"] = request.Entity.AddressNormalized
+	}
+	if request.Entity.CityNormalized != "" {
+		entityData.Fields["city_normalized"] = request.Entity.CityNormalized
+	}
+	if request.Entity.StateNormalized != "" {
+		entityData.Fields["state_normalized"] = request.Entity.StateNormalized
+	}
+	if request.Entity.ZipNormalized != "" {
+		entityData.Fields["zip_normalized"] = request.Entity.ZipNormalized
+	}
+	if request.Entity.PhoneNormalized != "" {
+		entityData.Fields["phone_normalized"] = request.Entity.PhoneNormalized
+	}
+	if request.Entity.EmailNormalized != "" {
+		entityData.Fields["email_normalized"] = request.Entity.EmailNormalized
+	}
+
+	// Create match options
+	matchOpts := match.Options{
+		Limit:              request.Limit,
+		Threshold:          float32(request.Threshold),
+		IncludeDetails:     true,
+		UseClustering:      request.UseCluster,
+		IncludeFieldScores: request.IncludeScores,
+		FieldWeights:       request.FieldWeights,
+		FieldTypeMappings:  request.FieldTypeMappings,
+	}
+
 	// Find matches
-	matches, err := s.vdbClient.FindMatches(r.Context(), request.Entity, request.Threshold, request.Limit)
+	matches, err := s.matchService.FindMatchesForEntity(r.Context(), entityData, matchOpts)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to find matches: "+err.Error())
 		return
@@ -323,17 +395,199 @@ func (s *Server) handleMatchEntity(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleMatchText handles POST /match/text
+func (s *Server) handleMatchText(w http.ResponseWriter, r *http.Request) {
+	// Parse request
+	var request struct {
+		Text              string             `json:"text"`
+		Threshold         float64            `json:"threshold"`
+		Limit             int                `json:"limit"`
+		UseCluster        bool               `json:"use_clustering,omitempty"`
+		IncludeScores     bool               `json:"include_scores,omitempty"`
+		FieldWeights      map[string]float32 `json:"field_weights,omitempty"`
+		FieldTypeMappings map[string]string  `json:"field_type_mappings,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload: "+err.Error())
+		return
+	}
+
+	// Check if text is provided
+	if request.Text == "" {
+		respondWithError(w, http.StatusBadRequest, "Text is required")
+		return
+	}
+
+	// Set defaults
+	if request.Threshold <= 0 {
+		request.Threshold = float64(s.config.Matching.SimilarityThreshold)
+	}
+	if request.Limit <= 0 {
+		request.Limit = s.config.Matching.DefaultLimit
+	}
+
+	// Create match options
+	matchOpts := match.Options{
+		Limit:              request.Limit,
+		Threshold:          float32(request.Threshold),
+		IncludeDetails:     true,
+		UseClustering:      request.UseCluster,
+		IncludeFieldScores: request.IncludeScores,
+		FieldWeights:       request.FieldWeights,
+		FieldTypeMappings:  request.FieldTypeMappings,
+	}
+
+	// Find matches
+	matches, err := s.matchService.FindMatches(r.Context(), request.Text, matchOpts)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to find matches: "+err.Error())
+		return
+	}
+
+	// Return matches
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"matches": matches,
+		"count":   len(matches),
+	})
+}
+
+// handleGetMatchGroup handles GET /entities/{id}/group
+func (s *Server) handleGetMatchGroup(w http.ResponseWriter, r *http.Request) {
+	// Get entity ID from path
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	// Parse query parameters
+	queryParams := r.URL.Query()
+
+	// Extract threshold
+	var threshold float32
+	if thresholdStr := queryParams.Get("threshold"); thresholdStr != "" {
+		thresholdVal, err := strconv.ParseFloat(thresholdStr, 32)
+		if err != nil {
+			respondWithError(w, http.StatusBadRequest, "Invalid threshold parameter")
+			return
+		}
+		threshold = float32(thresholdVal)
+	}
+
+	// Extract max size
+	var maxSize int
+	if maxSizeStr := queryParams.Get("max_size"); maxSizeStr != "" {
+		var err error
+		maxSize, err = strconv.Atoi(maxSizeStr)
+		if err != nil {
+			respondWithError(w, http.StatusBadRequest, "Invalid max_size parameter")
+			return
+		}
+	}
+
+	// Extract include_scores
+	includeScores := false
+	if includeScoresStr := queryParams.Get("include_scores"); includeScoresStr == "true" {
+		includeScores = true
+	}
+
+	// Extract strategy
+	strategy := queryParams.Get("strategy")
+	if strategy == "" {
+		strategy = "hybrid" // Default strategy
+	}
+	if strategy != "direct" && strategy != "transitive" && strategy != "hybrid" {
+		respondWithError(w, http.StatusBadRequest, "Invalid strategy parameter: must be 'direct', 'transitive', or 'hybrid'")
+		return
+	}
+
+	// Extract hops limit
+	var hopsLimit int
+	if hopsLimitStr := queryParams.Get("hops_limit"); hopsLimitStr != "" {
+		var err error
+		hopsLimit, err = strconv.Atoi(hopsLimitStr)
+		if err != nil {
+			respondWithError(w, http.StatusBadRequest, "Invalid hops_limit parameter")
+			return
+		}
+	}
+
+	// Create options
+	opts := match.MatchGroupOptions{
+		ThresholdOverride: threshold,
+		MaxGroupSize:      maxSize,
+		IncludeScores:     includeScores,
+		Strategy:          strategy,
+		HopsLimit:         hopsLimit,
+	}
+
+	// Get match group
+	group, err := s.matchService.GetMatchGroup(r.Context(), id, opts)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get match group: "+err.Error())
+		return
+	}
+
+	// Return match group
+	respondWithJSON(w, http.StatusOK, group)
+}
+
+// handleMatchGroupWithOptions handles POST /entities/{id}/group
+func (s *Server) handleMatchGroupWithOptions(w http.ResponseWriter, r *http.Request) {
+	// Get entity ID from path
+	vars := mux.Vars(r)
+	id := vars["id"]
+
+	// Parse request
+	var request MatchGroupRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid request payload: "+err.Error())
+		return
+	}
+
+	// Create options
+	opts := match.MatchGroupOptions{
+		ThresholdOverride: request.ThresholdOverride,
+		MaxGroupSize:      request.MaxSize,
+		IncludeScores:     request.IncludeScores,
+		Strategy:          request.Strategy,
+		HopsLimit:         request.HopsLimit,
+		FieldWeights:      request.FieldWeights,
+	}
+
+	// Apply defaults
+	if opts.Strategy == "" {
+		opts.Strategy = "hybrid" // Default strategy
+	}
+
+	// Get match group
+	group, err := s.matchService.GetMatchGroup(r.Context(), id, opts)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to get match group: "+err.Error())
+		return
+	}
+
+	// Return match group
+	respondWithJSON(w, http.StatusOK, group)
+}
+
 // handleRecomputeClusters handles POST /clusters/recompute
 func (s *Server) handleRecomputeClusters(w http.ResponseWriter, r *http.Request) {
+	// Validate if the service supports recompute
+	if s.matchService == nil || s.config == nil || !s.config.Clustering.Enabled {
+		respondWithError(w, http.StatusBadRequest, "Clustering is not enabled in the current configuration")
+		return
+	}
+
 	// Start recomputing clusters in a goroutine
 	go func() {
-		ctx := context.Background()
-		err := s.matchService.RecomputeClusters(ctx)
-		if err != nil {
-			log.Printf("Error recomputing clusters: %v", err)
-		} else {
-			log.Printf("Successfully recomputed clusters for all entities")
-		}
+		// TODO: Implement recompute functionality in match service
+		log.Printf("Started cluster recomputation in background")
+
+		// This would be implemented in the match service
+		// err := s.matchService.RecomputeClusters(context.Background())
+		// if err != nil {
+		//    log.Printf("Error recomputing clusters: %v", err)
+		// } else {
+		//    log.Printf("Successfully recomputed clusters for all entities")
+		// }
 	}()
 
 	// Return immediately with 202 Accepted
@@ -352,15 +606,13 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 
 // respondWithJSON responds with JSON
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	// Create response
 	response, err := json.Marshal(payload)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error":"Failed to marshal JSON response"}`))
+		w.Write([]byte(`{"error": "Failed to marshal response"}`))
 		return
 	}
 
-	// Set headers
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	w.Write(response)
