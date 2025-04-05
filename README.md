@@ -13,6 +13,8 @@ Resolve is an approximate entity matching system written in Go. It matches custo
 
 ## Architecture
 
+![Architecture](art/arch.png)
+
 Resolve follows a layered architecture:
 
 1. **Data Access Layer**
@@ -171,6 +173,75 @@ curl -X POST http://localhost:8080/match \
     "limit": 10
   }'
 ```
+
+## Clustering
+
+Resolve now supports clustering for faster candidate retrieval, implementing a similar approach to Zingg's blocking functionality. Clustering allows Resolve to pre-filter candidates before performing fine-grained vector similarity matching, significantly improving performance for large datasets.
+
+### How Clustering Works
+
+The clustering implementation uses a "canopy" approach:
+
+1. **Blocking key generation**: For each entity, Resolve extracts features from specified fields (e.g., first 3 characters of name, zip code prefix) to create a composite blocking key.
+2. **Cluster ID assignment**: Each entity is assigned to a cluster based on its blocking key.
+3. **Filtered matching**: When matching, Resolve first finds the query entity's cluster, then performs vector similarity search primarily within that cluster.
+4. **Fallback mechanism**: If no matches are found within the cluster, Resolve falls back to a global search.
+
+### Configuration
+
+Configure clustering in the `config.yaml` file:
+
+```yaml
+clustering:
+  enabled: true                  # Enable/disable clustering
+  method: "canopy"               # Currently only "canopy" is supported
+  fields:                        # Fields to use for blocking/clustering
+    - "name"
+    - "zip"
+  similarity_threshold: 0.8      # Threshold for clustering (for future methods)
+```
+
+### CLI Commands
+
+After configuring clustering, you can recompute clusters for all existing entities:
+
+```bash
+resolve --recompute-clusters
+```
+
+This is useful when:
+
+- You enable clustering for the first time with an existing database
+- You change the clustering configuration (e.g., adding new fields)
+- You want to force a rebuild of all clusters
+
+### API Endpoints
+
+Resolve provides an API endpoint for cluster maintenance:
+
+```
+POST /clusters/recompute
+```
+
+This endpoint triggers an asynchronous recomputation of all clusters and returns immediately with a 202 status.
+
+The match endpoint supports a new parameter `use_clustering` to control whether clustering should be used for a specific query:
+
+```json
+{
+  "entity": { ... },
+  "threshold": 0.85,
+  "limit": 10,
+  "use_clustering": true
+}
+```
+
+### Performance Considerations
+
+- Clustering is most beneficial for datasets with >10,000 entities
+- The optimal clustering fields depend on your data characteristics
+- Name and zip/postal code are generally effective clustering fields
+- Monitor performance with and without clustering for your specific use case
 
 ## Data Models
 

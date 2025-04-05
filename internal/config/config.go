@@ -58,6 +58,14 @@ type Config struct {
 		EnableStemming  bool            `mapstructure:"enable_stemming"`
 		EnableLowercase bool            `mapstructure:"enable_lowercase"`
 	} `mapstructure:"normalization"`
+
+	// Clustering configuration
+	Clustering struct {
+		Enabled             bool     `mapstructure:"enabled"`
+		Method              string   `mapstructure:"method"`
+		Fields              []string `mapstructure:"fields"`
+		SimilarityThreshold float64  `mapstructure:"similarity_threshold"`
+	} `mapstructure:"clustering"`
 }
 
 // Load loads the configuration from file and environment variables
@@ -149,6 +157,12 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("normalization.email_options", map[string]bool{
 		"lowercase_domain": true,
 	})
+
+	// Clustering defaults
+	v.SetDefault("clustering.enabled", false)
+	v.SetDefault("clustering.method", "canopy")
+	v.SetDefault("clustering.fields", []string{"name", "zip"})
+	v.SetDefault("clustering.similarity_threshold", 0.8)
 }
 
 // SaveDefault saves the default configuration to a file

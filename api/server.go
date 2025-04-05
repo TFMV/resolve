@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/TFMV/resolve/internal/config"
+	"github.com/TFMV/resolve/internal/match"
 	"github.com/TFMV/resolve/internal/weaviate"
 	"github.com/gorilla/mux"
 )
@@ -21,9 +22,10 @@ var timeNow = time.Now
 
 // MatchRequest represents a request to match an entity
 type MatchRequest struct {
-	Entity    *weaviate.EntityRecord `json:"entity"`
-	Threshold float64                `json:"threshold"`
-	Limit     int                    `json:"limit"`
+	Entity     *weaviate.EntityRecord `json:"entity"`
+	Threshold  float64                `json:"threshold"`
+	Limit      int                    `json:"limit"`
+	UseCluster bool                   `json:"use_clustering,omitempty"`
 }
 
 // Server represents the API server
@@ -31,51 +33,40 @@ type Server struct {
 	router       *mux.Router
 	config       *config.Config
 	vdbClient    *weaviate.Client
+	matchService *match.Service
 	httpServer   *http.Server
 	embeddingDim int
 }
 
 // NewServer creates a new API server
-func NewServer(cfg *config.Config, embeddingDim int) (*Server, error) {
-	// Initialize the vector database client
-	vdbClient, err := weaviate.NewClient(cfg, embeddingDim)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create vector database client: %w", err)
-	}
-
-	// Initialize the router
-	router := mux.NewRouter()
-
-	// Create the server
-	server := &Server{
-		router:       router,
+func NewServer(cfg *config.Config, vdbClient *weaviate.Client, matchService *match.Service, embeddingDim int) *Server {
+	return &Server{
 		config:       cfg,
 		vdbClient:    vdbClient,
+		matchService: matchService,
 		embeddingDim: embeddingDim,
+		router:       mux.NewRouter(),
 	}
-
-	// Register routes
-	server.registerRoutes()
-
-	return server, nil
 }
 
 // registerRoutes registers all API routes
 func (s *Server) registerRoutes() {
-	// Health check endpoint
-	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
+	// Health check
+	s.router.HandleFunc("/health", s.handleHealth).Methods(http.MethodGet)
 
 	// Entity endpoints
-	s.router.HandleFunc("/entities", s.handleGetEntities).Methods("GET")
-	s.router.HandleFunc("/entities", s.handleAddEntity).Methods("POST")
-	s.router.HandleFunc("/entities/{id}", s.handleGetEntity).Methods("GET")
-	s.router.HandleFunc("/entities/{id}", s.handleUpdateEntity).Methods("PUT")
-	s.router.HandleFunc("/entities/{id}", s.handleDeleteEntity).Methods("DELETE")
-	s.router.HandleFunc("/entities/batch", s.handleBatchAddEntities).Methods("POST")
-	s.router.HandleFunc("/entities/count", s.handleGetEntityCount).Methods("GET")
+	s.router.HandleFunc("/entities", s.handleAddEntity).Methods(http.MethodPost)
+	s.router.HandleFunc("/entities/{id}", s.handleGetEntity).Methods(http.MethodGet)
+	s.router.HandleFunc("/entities/{id}", s.handleUpdateEntity).Methods(http.MethodPut)
+	s.router.HandleFunc("/entities/{id}", s.handleDeleteEntity).Methods(http.MethodDelete)
+	s.router.HandleFunc("/entities/batch", s.handleBatchAddEntities).Methods(http.MethodPost)
+	s.router.HandleFunc("/entities/count", s.handleGetEntityCount).Methods(http.MethodGet)
 
 	// Matching endpoints
-	s.router.HandleFunc("/match", s.handleMatchEntity).Methods("POST")
+	s.router.HandleFunc("/match", s.handleMatchEntity).Methods(http.MethodPost)
+
+	// Clustering endpoints
+	s.router.HandleFunc("/clusters/recompute", s.handleRecomputeClusters).Methods(http.MethodPost)
 }
 
 // Start starts the API server
@@ -329,6 +320,26 @@ func (s *Server) handleMatchEntity(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"matches": matches,
 		"count":   len(matches),
+	})
+}
+
+// handleRecomputeClusters handles POST /clusters/recompute
+func (s *Server) handleRecomputeClusters(w http.ResponseWriter, r *http.Request) {
+	// Start recomputing clusters in a goroutine
+	go func() {
+		ctx := context.Background()
+		err := s.matchService.RecomputeClusters(ctx)
+		if err != nil {
+			log.Printf("Error recomputing clusters: %v", err)
+		} else {
+			log.Printf("Successfully recomputed clusters for all entities")
+		}
+	}()
+
+	// Return immediately with 202 Accepted
+	respondWithJSON(w, http.StatusAccepted, map[string]string{
+		"status":  "processing",
+		"message": "Cluster recomputation started. This operation runs in the background and may take some time to complete.",
 	})
 }
 

@@ -41,6 +41,15 @@ matching:
     phone: 0.1
     email: 0.1
 
+# Clustering configuration
+clustering:
+  enabled: true                  # Enable clustering for faster candidate retrieval
+  method: "canopy"               # Clustering method (currently only "canopy" is supported)
+  fields:                        # Fields to use for blocking/clustering
+    - "name"
+    - "zip"
+  similarity_threshold: 0.8      # Threshold for considering items in the same cluster
+
 # Normalization configuration
 normalization:
   enable_stopwords: true          # Remove common stopwords

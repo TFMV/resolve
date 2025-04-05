@@ -3,7 +3,6 @@ package weaviate
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	"github.com/TFMV/resolve/internal/config"
@@ -288,15 +287,9 @@ func (c *Client) BatchAddEntities(ctx context.Context, entities []*EntityRecord)
 
 		// Execute batch when it reaches the batch size
 		if (i+1)%batchSize == 0 || i == len(entities)-1 {
-			resp, err := batcher.Do(ctx)
+			_, err := batcher.Do(ctx)
 			if err != nil {
 				return results[:i+1], fmt.Errorf("failed to execute batch: %w", err)
-			}
-
-			// Check for errors in the batch response
-			if len(resp) > 0 {
-				// Log any errors in the batch operation
-				log.Printf("Batch operation completed for %d entities", i+1)
 			}
 
 			// Reset batcher for next batch
@@ -754,4 +747,135 @@ func (c *Client) parseEntityFromResult(obj map[string]interface{}) *EntityRecord
 	}
 
 	return entity
+}
+
+// ListEntities retrieves a paginated list of entities from Weaviate
+func (c *Client) ListEntities(ctx context.Context, offset int, limit int) ([]*EntityRecord, error) {
+	if !c.schemaInitDone {
+		if err := c.InitSchema(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	// Build field selection
+	fields := []graphql.Field{
+		{Name: "name"},
+		{Name: "name_normalized"},
+		{Name: "address"},
+		{Name: "address_normalized"},
+		{Name: "city"},
+		{Name: "city_normalized"},
+		{Name: "state"},
+		{Name: "state_normalized"},
+		{Name: "zip"},
+		{Name: "zip_normalized"},
+		{Name: "phone"},
+		{Name: "phone_normalized"},
+		{Name: "email"},
+		{Name: "email_normalized"},
+		{Name: "created_at"},
+		{Name: "updated_at"},
+		{Name: "metadata"},
+		{Name: "_additional", Fields: []graphql.Field{
+			{Name: "id"},
+			{Name: "vector"},
+		}},
+	}
+
+	// Execute query
+	query := c.client.GraphQL().Get().
+		WithClassName(c.className).
+		WithFields(fields...).
+		WithLimit(limit).
+		WithOffset(offset)
+
+	// Execute query
+	result, err := query.Do(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute query: %w", err)
+	}
+
+	// Parse results
+	entities := make([]*EntityRecord, 0)
+	if len(result.Data["Get"].(map[string]interface{})[c.className].([]interface{})) == 0 {
+		return entities, nil
+	}
+
+	for _, obj := range result.Data["Get"].(map[string]interface{})[c.className].([]interface{}) {
+		entity := c.parseEntityFromResult(obj.(map[string]interface{}))
+		entities = append(entities, entity)
+	}
+
+	return entities, nil
+}
+
+// BatchUpdateEntities updates multiple entities in a batch
+func (c *Client) BatchUpdateEntities(ctx context.Context, entities []*EntityRecord) ([]string, error) {
+	if !c.schemaInitDone {
+		if err := c.InitSchema(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	batchSize := 100 // Weaviate recommends batches of 100-200 objects
+	batcher := c.client.Batch().ObjectsBatcher()
+	results := make([]string, len(entities))
+	now := time.Now().Unix()
+
+	for i, entity := range entities {
+		// Generate ID if not provided
+		if entity.ID == "" {
+			entity.ID = uuid.New().String()
+		}
+		results[i] = entity.ID
+
+		// Update timestamp
+		entity.UpdatedAt = now
+
+		// Prepare object properties
+		objProperties := map[string]interface{}{
+			"name":               entity.Name,
+			"name_normalized":    entity.NameNormalized,
+			"address":            entity.Address,
+			"address_normalized": entity.AddressNormalized,
+			"city":               entity.City,
+			"city_normalized":    entity.CityNormalized,
+			"state":              entity.State,
+			"state_normalized":   entity.StateNormalized,
+			"zip":                entity.Zip,
+			"zip_normalized":     entity.ZipNormalized,
+			"phone":              entity.Phone,
+			"phone_normalized":   entity.PhoneNormalized,
+			"email":              entity.Email,
+			"email_normalized":   entity.EmailNormalized,
+			"created_at":         entity.CreatedAt,
+			"updated_at":         entity.UpdatedAt,
+		}
+
+		// Add metadata if provided
+		if entity.Metadata != nil {
+			objProperties["metadata"] = entity.Metadata
+		}
+
+		// Add to batch
+		batcher = batcher.WithObjects(&models.Object{
+			Class:      c.className,
+			ID:         strfmt.UUID(entity.ID),
+			Properties: objProperties,
+			Vector:     entity.Vector,
+		})
+
+		// Execute batch when it reaches the batch size
+		if (i+1)%batchSize == 0 || i == len(entities)-1 {
+			_, err := batcher.Do(ctx)
+			if err != nil {
+				return results[:i+1], fmt.Errorf("failed to execute batch update: %w", err)
+			}
+
+			// Reset batcher for next batch
+			batcher = c.client.Batch().ObjectsBatcher()
+		}
+	}
+
+	return results, nil
 }
