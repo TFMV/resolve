@@ -31,6 +31,10 @@ var (
 	withDetails       bool
 	showHelp          bool
 	recomputeClusters bool
+	groupID           string
+	groupStrategy     string
+	groupHopsLimit    int
+	fieldScores       bool
 )
 
 func main() {
@@ -45,6 +49,10 @@ func main() {
 	flag.BoolVar(&withDetails, "details", false, "Include match details")
 	flag.BoolVar(&showHelp, "help", false, "Show help information")
 	flag.BoolVar(&recomputeClusters, "recompute-clusters", false, "Recompute clusters for all entities")
+	flag.StringVar(&groupID, "group", "", "Find match group for the specified entity ID")
+	flag.StringVar(&groupStrategy, "group-strategy", "direct", "Group strategy: direct, transitive, or hybrid")
+	flag.IntVar(&groupHopsLimit, "group-hops", 2, "Maximum number of hops for transitive matching")
+	flag.BoolVar(&fieldScores, "field-scores", false, "Enable field-level similarity scoring")
 	flag.Parse()
 
 	// Check for help flag
@@ -60,7 +68,7 @@ func main() {
 	}
 
 	// Ensure at least one command is specified
-	if ingestFile == "" && matchFile == "" && matchString == "" && !recomputeClusters {
+	if ingestFile == "" && matchFile == "" && matchString == "" && !recomputeClusters && groupID == "" {
 		log.Fatal("Error: No command specified. Use --help for usage information.")
 	}
 
@@ -103,15 +111,19 @@ func main() {
 	}
 
 	if matchFile != "" {
-		processMatchFile(ctx, matchService, matchFile, threshold, limit, withDetails)
+		processMatchFile(ctx, matchService, matchFile, threshold, limit, withDetails, fieldScores)
 	}
 
 	if matchString != "" {
-		processMatchString(ctx, matchService, matchString, threshold, limit, withDetails)
+		processMatchString(ctx, matchService, matchString, threshold, limit, withDetails, fieldScores)
 	}
 
 	if recomputeClusters {
 		processRecomputeClusters(ctx, matchService)
+	}
+
+	if groupID != "" {
+		processMatchGroup(ctx, matchService, groupID, threshold, groupStrategy, groupHopsLimit)
 	}
 }
 
@@ -144,7 +156,7 @@ func processIngest(ctx context.Context, matchService *match.Service, filePath st
 }
 
 // processMatchFile matches entities from a file
-func processMatchFile(ctx context.Context, matchService *match.Service, filePath string, threshold float64, limit int, withDetails bool) {
+func processMatchFile(ctx context.Context, matchService *match.Service, filePath string, threshold float64, limit int, withDetails bool, fieldScores bool) {
 	// Read and parse the match file
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -158,9 +170,10 @@ func processMatchFile(ctx context.Context, matchService *match.Service, filePath
 
 	// Set up match options
 	opts := match.Options{
-		Threshold:      float32(threshold),
-		Limit:          limit,
-		IncludeDetails: withDetails,
+		Threshold:          float32(threshold),
+		Limit:              limit,
+		IncludeDetails:     withDetails,
+		IncludeFieldScores: fieldScores,
 	}
 
 	// Search for matches
@@ -184,12 +197,13 @@ func processMatchFile(ctx context.Context, matchService *match.Service, filePath
 }
 
 // processMatchString matches a string query
-func processMatchString(ctx context.Context, matchService *match.Service, queryString string, threshold float64, limit int, withDetails bool) {
+func processMatchString(ctx context.Context, matchService *match.Service, queryString string, threshold float64, limit int, withDetails bool, fieldScores bool) {
 	// Set up match options
 	opts := match.Options{
-		Threshold:      float32(threshold),
-		Limit:          limit,
-		IncludeDetails: withDetails,
+		Threshold:          float32(threshold),
+		Limit:              limit,
+		IncludeDetails:     withDetails,
+		IncludeFieldScores: fieldScores,
 	}
 
 	// Search for matches
@@ -210,6 +224,38 @@ func processMatchString(ctx context.Context, matchService *match.Service, queryS
 	} else {
 		fmt.Println("No matches found.")
 	}
+}
+
+// processMatchGroup finds all entities in the same match group
+func processMatchGroup(ctx context.Context, matchService *match.Service, entityID string, threshold float64, strategy string, hopsLimit int) {
+	// Set up group options
+	opts := match.MatchGroupOptions{
+		ThresholdOverride: float32(threshold),
+		Strategy:          strategy,
+		HopsLimit:         hopsLimit,
+		IncludeScores:     true,
+	}
+
+	// Log start
+	log.Printf("Finding match group for entity %s using %s strategy", entityID, strategy)
+	startTime := time.Now()
+
+	// Get the match group
+	group, err := matchService.GetMatchGroup(ctx, entityID, opts)
+	if err != nil {
+		log.Fatalf("Error finding match group: %v", err)
+	}
+
+	// Log and output results
+	duration := time.Since(startTime)
+	log.Printf("Found match group with %d entities in %.2f seconds", group.Size, duration.Seconds())
+
+	// Print group details
+	output, err := json.MarshalIndent(group, "", "  ")
+	if err != nil {
+		log.Fatalf("Error formatting results: %v", err)
+	}
+	fmt.Println(string(output))
 }
 
 // processRecomputeClusters handles recomputing clusters for all entities
@@ -301,20 +347,26 @@ func printUsage() {
 	fmt.Println("  resolve [flags]")
 	fmt.Println()
 	fmt.Println("Flags:")
-	fmt.Println("  --config string       Path to configuration file (default \"config.yaml\")")
-	fmt.Println("  --ingest string       Path to JSON file with entities to ingest")
-	fmt.Println("  --match-file string   Path to JSON file with entity to match")
-	fmt.Println("  --match string        Entity string to match")
-	fmt.Println("  --threshold float     Match threshold (0.0-1.0)")
-	fmt.Println("  --limit int           Maximum number of matches to return")
-	fmt.Println("  --details             Include match details")
-	fmt.Println("  --recompute-clusters  Recompute clusters for all entities")
-	fmt.Println("  --version             Show version information")
-	fmt.Println("  --help                Show this help information")
+	fmt.Println("  --config string            Path to configuration file (default \"config.yaml\")")
+	fmt.Println("  --ingest string            Path to JSON file with entities to ingest")
+	fmt.Println("  --match-file string        Path to JSON file with entity to match")
+	fmt.Println("  --match string             Entity string to match")
+	fmt.Println("  --threshold float          Match threshold (0.0-1.0)")
+	fmt.Println("  --limit int                Maximum number of matches to return")
+	fmt.Println("  --details                  Include match details")
+	fmt.Println("  --field-scores             Include field-level similarity scores")
+	fmt.Println("  --recompute-clusters       Recompute clusters for all entities")
+	fmt.Println("  --group string             Find match group for the specified entity ID")
+	fmt.Println("  --group-strategy string    Group strategy: direct, transitive, or hybrid (default \"direct\")")
+	fmt.Println("  --group-hops int           Maximum number of hops for transitive matching (default 2)")
+	fmt.Println("  --version                  Show version information")
+	fmt.Println("  --help                     Show this help information")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  resolve --ingest entities.json")
 	fmt.Println("  resolve --match-file query.json --threshold 0.8 --limit 5")
 	fmt.Println("  resolve --match \"Acme Corporation\" --threshold 0.7")
 	fmt.Println("  resolve --recompute-clusters")
+	fmt.Println("  resolve --group entity-123 --group-strategy transitive --group-hops 3")
+	fmt.Println("  resolve --match-file query.json --field-scores")
 }

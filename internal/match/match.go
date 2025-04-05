@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/TFMV/resolve/internal/cluster"
 	"github.com/TFMV/resolve/internal/config"
 	"github.com/TFMV/resolve/internal/embed"
 	"github.com/TFMV/resolve/internal/normalize"
+	"github.com/TFMV/resolve/internal/similarity"
 	"github.com/TFMV/resolve/internal/weaviate"
 )
 
@@ -18,6 +20,15 @@ type EntityData struct {
 	ID       string                 `json:"id,omitempty"`
 	Fields   map[string]string      `json:"fields"`
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+}
+
+// FieldScore represents a similarity score for a specific field
+type FieldScore struct {
+	Score        float32 `json:"score"`
+	QueryValue   string  `json:"query_value,omitempty"`
+	MatchedValue string  `json:"matched_value,omitempty"`
+	SimilarityFn string  `json:"similarity_function,omitempty"`
+	Normalized   bool    `json:"normalized,omitempty"`
 }
 
 // MatchResult represents a match result with scores
@@ -30,15 +41,19 @@ type MatchResult struct {
 	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 	CreatedAt   int64                  `json:"created_at,omitempty"`
 	UpdatedAt   int64                  `json:"updated_at,omitempty"`
-	FieldScores map[string]float32     `json:"field_scores,omitempty"`
+	FieldScores map[string]FieldScore  `json:"field_scores,omitempty"`
 }
 
 // Options represents matching options
 type Options struct {
-	Limit          int
-	Threshold      float32
-	IncludeDetails bool
-	UseClustering  bool // Whether to use clustering
+	Limit                 int
+	Threshold             float32
+	IncludeDetails        bool
+	UseClustering         bool               // Whether to use clustering
+	IncludeFieldScores    bool               // Whether to include field-level similarity scores
+	FieldWeights          map[string]float32 // Optional field weights for weighted scoring
+	FieldTypeMappings     map[string]string  // Optional field type mappings for similarity functions
+	ForceExactMatchFields []string           // Fields that should use exact matching
 }
 
 // Service represents the matching service
@@ -48,6 +63,7 @@ type Service struct {
 	embeddingService embed.EmbeddingService
 	weaviateClient   *weaviate.Client
 	clusterService   *cluster.Service
+	similarityReg    *similarity.Registry
 }
 
 // NewService creates a new matching service
@@ -64,12 +80,16 @@ func NewService(cfg *config.Config, weaviateClient *weaviate.Client, embeddingSe
 	}
 	clusterService := cluster.NewService(clusterConfig, normalizer)
 
+	// Create similarity registry
+	similarityReg := similarity.NewRegistry()
+
 	return &Service{
 		cfg:              cfg,
 		normalizer:       normalizer,
 		embeddingService: embeddingService,
 		weaviateClient:   weaviateClient,
 		clusterService:   clusterService,
+		similarityReg:    similarityReg,
 	}
 }
 
@@ -199,41 +219,52 @@ func (s *Service) FindMatches(ctx context.Context, text string, opts Options) ([
 		return nil, fmt.Errorf("failed to search Weaviate: %w", err)
 	}
 
-	// If no results with cluster filtering and clustering is enabled, try again without filtering
-	if len(results) == 0 && opts.UseClustering && s.cfg.Clustering.Enabled {
-		results, err = s.weaviateClient.SearchEntities(ctx, vector, searchLimit, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to search Weaviate with fallback: %w", err)
-		}
-	}
+	// Parse input fields if text contains field=value pairs
+	queryFields := parseQueryFields(text)
 
-	// Convert and filter results
-	matches := make([]MatchResult, 0, len(results))
+	// Convert to match results
+	matchResults := make([]MatchResult, 0, len(results))
 	for _, result := range results {
-		// Calculate confidence score from distance (1 - distance)
-		// Weaviate uses cosine distance, so 0 means identical vectors, 2 means opposite vectors
-		score := float32(1.0)
+		// Get score from metadata (distance is stored there by Weaviate client)
+		score := float32(1.0) // Default score
+		if result.Metadata != nil {
+			if distVal, ok := result.Metadata["distance"].(float64); ok {
+				// Convert distance to similarity score (1 - distance)
+				score = float32(1.0 - distVal)
+			}
+		}
 
-		// Skip if below threshold
+		// Skip results with a score below threshold
 		if score < opts.Threshold {
 			continue
 		}
 
-		// Create match result
-		match := convertToMatchResult(result, score, opts.IncludeDetails)
-		matches = append(matches, match)
+		// Convert to match result
+		matchResult := convertToMatchResult(result, score)
+
+		// Apply field-level scoring if requested
+		if opts.IncludeFieldScores || len(queryFields) > 0 {
+			s.computeFieldScores(&matchResult, queryFields, opts)
+		}
+
+		matchResults = append(matchResults, matchResult)
 	}
 
-	// Limit the final results
-	if len(matches) > opts.Limit {
-		matches = matches[:opts.Limit]
+	// Sort by score descending
+	sort.Slice(matchResults, func(i, j int) bool {
+		return matchResults[i].Score > matchResults[j].Score
+	})
+
+	// Apply limit after final sorting
+	if len(matchResults) > opts.Limit {
+		matchResults = matchResults[:opts.Limit]
 	}
 
-	return matches, nil
+	return matchResults, nil
 }
 
-// FindMatchesForEntity finds the best matching entities for an entity
-func (s *Service) FindMatchesForEntity(ctx context.Context, data EntityData, opts Options) ([]MatchResult, error) {
+// FindMatchesForEntity finds the best matching entities for the given entity
+func (s *Service) FindMatchesForEntity(ctx context.Context, entity EntityData, opts Options) ([]MatchResult, error) {
 	// Apply default options if needed
 	if opts.Limit <= 0 {
 		opts.Limit = s.cfg.Matching.DefaultLimit
@@ -243,182 +274,294 @@ func (s *Service) FindMatchesForEntity(ctx context.Context, data EntityData, opt
 		opts.Threshold = s.cfg.Matching.SimilarityThreshold
 	}
 
-	// Default to using clustering if enabled and not explicitly disabled
-	if !opts.UseClustering {
-		opts.UseClustering = s.cfg.Clustering.Enabled
-	}
-
 	// Normalize fields
-	normalizedFields := s.normalizer.NormalizeEntity(data.Fields)
+	normalizedFields := s.normalizer.NormalizeEntity(entity.Fields)
 
 	// Concatenate fields for embedding
 	textToEmbed := combineFields(normalizedFields)
 
-	// Generate embedding
-	vector, err := s.embeddingService.GetEmbedding(ctx, textToEmbed)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate embedding for query: %w", err)
-	}
-
-	// Create entity record for clustering
-	entity := convertToWeaviateEntity(data.ID, normalizedFields, vector, data.Metadata)
-
-	// Get cluster filter if clustering is enabled
-	var filterParams map[string]string
-	if opts.UseClustering && s.cfg.Clustering.Enabled {
-		_, err = s.clusterService.AssignCluster(ctx, entity)
-		if err != nil {
-			return nil, fmt.Errorf("failed to assign cluster to query entity: %w", err)
-		}
-
-		filterParams = s.clusterService.GetClusterFilterForEntity(ctx, entity)
-	}
-
-	// Double the limit to account for filtering effect of clustering
-	var searchLimit int
-	if opts.UseClustering && s.cfg.Clustering.Enabled {
-		searchLimit = opts.Limit * 3 // Get more candidates to compensate for cluster filtering
-	} else {
-		searchLimit = opts.Limit
-	}
-
-	// Search in Weaviate
-	results, err := s.weaviateClient.SearchEntities(ctx, vector, searchLimit, filterParams)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search Weaviate: %w", err)
-	}
-
-	// If no results with cluster filtering and clustering is enabled, try again without filtering
-	if len(results) == 0 && opts.UseClustering && s.cfg.Clustering.Enabled {
-		results, err = s.weaviateClient.SearchEntities(ctx, vector, searchLimit, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to search Weaviate with fallback: %w", err)
-		}
-	}
-
-	// Convert and filter results
-	matches := make([]MatchResult, 0, len(results))
-	for _, result := range results {
-		// Skip if it's the same entity
-		if data.ID != "" && data.ID == result.ID {
-			continue
-		}
-
-		// Calculate confidence score from distance (1 - distance)
-		score := float32(1.0)
-
-		// Skip if below threshold
-		if score < opts.Threshold {
-			continue
-		}
-
-		// Create match result
-		match := convertToMatchResult(result, score, opts.IncludeDetails)
-		matches = append(matches, match)
-	}
-
-	// Limit the final results
-	if len(matches) > opts.Limit {
-		matches = matches[:opts.Limit]
-	}
-
-	return matches, nil
+	// Then use the regular FindMatches method
+	return s.FindMatches(ctx, textToEmbed, opts)
 }
 
-// RecomputeClusters recomputes clusters for all entities
-func (s *Service) RecomputeClusters(ctx context.Context) error {
-	if !s.cfg.Clustering.Enabled {
-		return fmt.Errorf("clustering is not enabled in the configuration")
+// computeFieldScores calculates and adds field-level similarity scores to the match result
+func (s *Service) computeFieldScores(result *MatchResult, queryFields map[string]string, opts Options) {
+	// Initialize field scores map if needed
+	if result.FieldScores == nil {
+		result.FieldScores = make(map[string]FieldScore)
 	}
 
-	batchSize := 100 // Process entities in batches
-	return s.clusterService.RecomputeAllClusters(ctx, s.weaviateClient, batchSize)
-}
-
-// GetEntityCount gets the total count of entities in the database
-func (s *Service) GetEntityCount(ctx context.Context) (int, error) {
-	return s.weaviateClient.GetCount(ctx)
-}
-
-// combineFields combines normalized fields into a single string for embedding
-func combineFields(fields map[string]string) string {
-	result := ""
-
-	// Order matters for deterministic embeddings
-	keys := []string{"name_normalized", "address_normalized", "city_normalized", "state_normalized", "zip_normalized", "phone_normalized", "email_normalized"}
-
-	for _, key := range keys {
-		if value, exists := fields[key]; exists && value != "" {
-			if result != "" {
-				result += " "
+	// If queryFields is empty, compare with all fields in the match
+	if len(queryFields) == 0 {
+		// Use match fields directly
+		for fieldName, fieldValue := range result.Fields {
+			// Skip empty fields
+			if fieldValue == "" {
+				continue
 			}
-			result += value
+
+			// Get field similarity function
+			var simFn similarity.Function
+			if fieldType, ok := opts.FieldTypeMappings[fieldName]; ok {
+				simFn = s.similarityReg.GetByFieldType(fieldType)
+			} else {
+				// Infer field type from name
+				simFn = s.inferSimilarityFunction(fieldName)
+			}
+
+			// Check if this field should use exact matching
+			for _, exactField := range opts.ForceExactMatchFields {
+				if exactField == fieldName {
+					simFn = s.similarityReg.ExactMatch()
+					break
+				}
+			}
+
+			// Calculate field score - compare with itself since we don't have a query value
+			score := float32(simFn.Compare(fieldValue, fieldValue))
+
+			// Add to field scores
+			result.FieldScores[fieldName] = FieldScore{
+				Score:        score,
+				MatchedValue: fieldValue,
+				SimilarityFn: simFn.Name(),
+				Normalized:   true,
+			}
+		}
+	} else {
+		// Compare query fields with match fields
+		for queryField, queryValue := range queryFields {
+			// Skip if query value is empty
+			if queryValue == "" {
+				continue
+			}
+
+			// Get the corresponding field value from the match
+			matchValue, ok := result.Fields[queryField]
+			if !ok {
+				// Field not found in match, skip
+				continue
+			}
+
+			// Get field similarity function
+			var simFn similarity.Function
+			if fieldType, ok := opts.FieldTypeMappings[queryField]; ok {
+				simFn = s.similarityReg.GetByFieldType(fieldType)
+			} else {
+				// Infer field type from name
+				simFn = s.inferSimilarityFunction(queryField)
+			}
+
+			// Check if this field should use exact matching
+			for _, exactField := range opts.ForceExactMatchFields {
+				if exactField == queryField {
+					simFn = s.similarityReg.ExactMatch()
+					break
+				}
+			}
+
+			// Calculate field score
+			score := float32(simFn.Compare(queryValue, matchValue))
+
+			// Add to field scores
+			result.FieldScores[queryField] = FieldScore{
+				Score:        score,
+				QueryValue:   queryValue,
+				MatchedValue: matchValue,
+				SimilarityFn: simFn.Name(),
+				Normalized:   true,
+			}
 		}
 	}
 
-	return result
+	// Optionally update the overall score if field weights are provided
+	if len(opts.FieldWeights) > 0 && len(result.FieldScores) > 0 {
+		weightedScore := computeWeightedScore(result.FieldScores, opts.FieldWeights)
+
+		// Blend the vector score with the field-level score
+		// Default to equal weighting
+		result.Score = (result.Score + weightedScore) / 2
+	}
 }
 
-// convertToWeaviateEntity converts a normalized entity to Weaviate's format
-func convertToWeaviateEntity(id string, fields map[string]string, vector []float32, metadata map[string]interface{}) *weaviate.EntityRecord {
-	entity := &weaviate.EntityRecord{
-		ID:        id,
-		Vector:    vector,
-		Metadata:  metadata,
-		CreatedAt: time.Now().Unix(),
-		UpdatedAt: time.Now().Unix(),
+// inferSimilarityFunction infers the appropriate similarity function for a field based on its name
+func (s *Service) inferSimilarityFunction(fieldName string) similarity.Function {
+	fieldNameLower := strings.ToLower(fieldName)
+
+	// Check if the field name contains common indicators
+	if strings.Contains(fieldNameLower, "name") ||
+		strings.Contains(fieldNameLower, "company") ||
+		strings.Contains(fieldNameLower, "business") ||
+		strings.Contains(fieldNameLower, "organization") {
+		return s.similarityReg.Name()
 	}
 
-	// Copy fields
-	if name, exists := fields["name"]; exists {
+	if strings.Contains(fieldNameLower, "address") ||
+		strings.Contains(fieldNameLower, "street") {
+		return s.similarityReg.Address()
+	}
+
+	if strings.Contains(fieldNameLower, "phone") ||
+		strings.Contains(fieldNameLower, "tel") ||
+		strings.Contains(fieldNameLower, "mobile") ||
+		strings.Contains(fieldNameLower, "cell") ||
+		strings.Contains(fieldNameLower, "fax") {
+		return s.similarityReg.Phone()
+	}
+
+	if strings.Contains(fieldNameLower, "email") {
+		return s.similarityReg.Email()
+	}
+
+	if strings.Contains(fieldNameLower, "zip") ||
+		strings.Contains(fieldNameLower, "postal") {
+		return s.similarityReg.ZipCode()
+	}
+
+	// Default to generic text similarity
+	return s.similarityReg.Text()
+}
+
+// parseQueryFields attempts to parse field=value pairs from the input text
+// Format: field1=value1;field2=value2;...
+func parseQueryFields(text string) map[string]string {
+	fields := make(map[string]string)
+
+	// Check if the text contains field=value format
+	if !strings.Contains(text, "=") {
+		return fields
+	}
+
+	// Split by semicolon or comma
+	var pairs []string
+	if strings.Contains(text, ";") {
+		pairs = strings.Split(text, ";")
+	} else if strings.Contains(text, ",") {
+		pairs = strings.Split(text, ",")
+	} else {
+		// Single pair
+		pairs = []string{text}
+	}
+
+	// Process each pair
+	for _, pair := range pairs {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+
+		// Split by equals sign
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		fieldName := strings.TrimSpace(parts[0])
+		fieldValue := strings.TrimSpace(parts[1])
+
+		if fieldName != "" && fieldValue != "" {
+			fields[fieldName] = fieldValue
+		}
+	}
+
+	return fields
+}
+
+// computeWeightedScore calculates a weighted score based on field-level scores and weights
+func computeWeightedScore(fieldScores map[string]FieldScore, fieldWeights map[string]float32) float32 {
+	var totalScore float32
+	var totalWeight float32
+
+	for fieldName, fieldScore := range fieldScores {
+		weight, ok := fieldWeights[fieldName]
+		if !ok {
+			// Use default weight if not specified
+			weight = 1.0
+		}
+
+		totalScore += fieldScore.Score * weight
+		totalWeight += weight
+	}
+
+	// Avoid division by zero
+	if totalWeight == 0 {
+		return 0
+	}
+
+	return totalScore / totalWeight
+}
+
+// convertToWeaviateEntity converts EntityData to a Weaviate entity record
+func convertToWeaviateEntity(id string, fields map[string]string, vector []float32, metadata map[string]interface{}) *weaviate.EntityRecord {
+	// Create a new entity record
+	entity := &weaviate.EntityRecord{
+		ID:       id,
+		Vector:   vector,
+		Metadata: metadata,
+	}
+
+	// Add timestamps if not present in metadata
+	now := time.Now().Unix()
+	if entity.Metadata == nil {
+		entity.Metadata = make(map[string]interface{})
+	}
+	if _, ok := entity.Metadata["created_at"]; !ok {
+		entity.Metadata["created_at"] = now
+	}
+	if _, ok := entity.Metadata["updated_at"]; !ok {
+		entity.Metadata["updated_at"] = now
+	}
+
+	// Map standard fields to the entity
+	if name, ok := fields["name"]; ok {
 		entity.Name = name
 	}
-	if normalizedName, exists := fields["name_normalized"]; exists {
-		entity.NameNormalized = normalizedName
+	if name, ok := fields["name_normalized"]; ok {
+		entity.NameNormalized = name
 	}
-	if address, exists := fields["address"]; exists {
+	if address, ok := fields["address"]; ok {
 		entity.Address = address
 	}
-	if normalizedAddress, exists := fields["address_normalized"]; exists {
-		entity.AddressNormalized = normalizedAddress
+	if address, ok := fields["address_normalized"]; ok {
+		entity.AddressNormalized = address
 	}
-	if city, exists := fields["city"]; exists {
+	if city, ok := fields["city"]; ok {
 		entity.City = city
 	}
-	if normalizedCity, exists := fields["city_normalized"]; exists {
-		entity.CityNormalized = normalizedCity
+	if city, ok := fields["city_normalized"]; ok {
+		entity.CityNormalized = city
 	}
-	if state, exists := fields["state"]; exists {
+	if state, ok := fields["state"]; ok {
 		entity.State = state
 	}
-	if normalizedState, exists := fields["state_normalized"]; exists {
-		entity.StateNormalized = normalizedState
+	if state, ok := fields["state_normalized"]; ok {
+		entity.StateNormalized = state
 	}
-	if zip, exists := fields["zip"]; exists {
+	if zip, ok := fields["zip"]; ok {
 		entity.Zip = zip
 	}
-	if normalizedZip, exists := fields["zip_normalized"]; exists {
-		entity.ZipNormalized = normalizedZip
+	if zip, ok := fields["zip_normalized"]; ok {
+		entity.ZipNormalized = zip
 	}
-	if phone, exists := fields["phone"]; exists {
+	if phone, ok := fields["phone"]; ok {
 		entity.Phone = phone
 	}
-	if normalizedPhone, exists := fields["phone_normalized"]; exists {
-		entity.PhoneNormalized = normalizedPhone
+	if phone, ok := fields["phone_normalized"]; ok {
+		entity.PhoneNormalized = phone
 	}
-	if email, exists := fields["email"]; exists {
+	if email, ok := fields["email"]; ok {
 		entity.Email = email
 	}
-	if normalizedEmail, exists := fields["email_normalized"]; exists {
-		entity.EmailNormalized = normalizedEmail
+	if email, ok := fields["email_normalized"]; ok {
+		entity.EmailNormalized = email
 	}
 
 	return entity
 }
 
-// convertToMatchResult converts a Weaviate entity to a match result
-func convertToMatchResult(entity *weaviate.EntityRecord, score float32, includeDetails bool) MatchResult {
-	// Create fields map
+// convertToMatchResult converts a Weaviate EntityRecord to a MatchResult
+func convertToMatchResult(entity *weaviate.EntityRecord, score float32) MatchResult {
+	// Create fields map from the entity's fields
 	fields := map[string]string{
 		"name":    entity.Name,
 		"address": entity.Address,
@@ -429,117 +572,103 @@ func convertToMatchResult(entity *weaviate.EntityRecord, score float32, includeD
 		"email":   entity.Email,
 	}
 
-	// Create match result
-	match := MatchResult{
-		ID:        entity.ID,
-		Score:     score,
-		Fields:    fields,
-		Metadata:  entity.Metadata,
-		CreatedAt: entity.CreatedAt,
-		UpdatedAt: entity.UpdatedAt,
+	// Add normalized fields if available
+	if entity.NameNormalized != "" {
+		fields["name_normalized"] = entity.NameNormalized
+	}
+	if entity.AddressNormalized != "" {
+		fields["address_normalized"] = entity.AddressNormalized
+	}
+	if entity.CityNormalized != "" {
+		fields["city_normalized"] = entity.CityNormalized
+	}
+	if entity.StateNormalized != "" {
+		fields["state_normalized"] = entity.StateNormalized
+	}
+	if entity.ZipNormalized != "" {
+		fields["zip_normalized"] = entity.ZipNormalized
+	}
+	if entity.PhoneNormalized != "" {
+		fields["phone_normalized"] = entity.PhoneNormalized
+	}
+	if entity.EmailNormalized != "" {
+		fields["email_normalized"] = entity.EmailNormalized
 	}
 
-	// Add field scores if details are requested
-	if includeDetails {
-		match.FieldScores = map[string]float32{
-			"name":    1.0,
-			"address": 1.0,
-			"city":    1.0,
-			"state":   1.0,
-			"zip":     1.0,
-			"phone":   1.0,
-			"email":   1.0,
+	// Extract timestamps from metadata if available
+	var createdAt, updatedAt int64
+	if entity.Metadata != nil {
+		if val, ok := entity.Metadata["created_at"]; ok {
+			if timestamp, ok := val.(float64); ok {
+				createdAt = int64(timestamp)
+			}
+		}
+		if val, ok := entity.Metadata["updated_at"]; ok {
+			if timestamp, ok := val.(float64); ok {
+				updatedAt = int64(timestamp)
+			}
 		}
 	}
 
-	return match
+	// Get matched fields for explanation
+	matchedOn := getMatchedFields(fields)
+	explanation := generateExplanation(score, matchedOn)
+
+	return MatchResult{
+		ID:          entity.ID,
+		Score:       score,
+		Fields:      fields,
+		MatchedOn:   matchedOn,
+		Explanation: explanation,
+		Metadata:    entity.Metadata,
+		CreatedAt:   createdAt,
+		UpdatedAt:   updatedAt,
+		FieldScores: make(map[string]FieldScore),
+	}
 }
 
-// determineMatchedFields determines which fields matched between entities
-func determineMatchedFields(query map[string]string, result *weaviate.EntityRecord) []string {
-	matchedFields := make([]string, 0)
-
-	// Check name
-	if queryName, exists := query["name_normalized"]; exists && queryName != "" {
-		if result.NameNormalized == queryName {
-			matchedFields = append(matchedFields, "name")
+// getMatchedFields determines which fields contributed to matching
+// This is a heuristic since the exact match details are not provided by Weaviate
+func getMatchedFields(fields map[string]string) []string {
+	var matchedFields []string
+	for field, value := range fields {
+		if value != "" && !strings.HasSuffix(field, "_normalized") {
+			matchedFields = append(matchedFields, field)
 		}
 	}
-
-	// Check address
-	if queryAddr, exists := query["address_normalized"]; exists && queryAddr != "" {
-		if result.AddressNormalized == queryAddr {
-			matchedFields = append(matchedFields, "address")
-		}
-	}
-
-	// Check city
-	if queryCity, exists := query["city_normalized"]; exists && queryCity != "" {
-		if result.CityNormalized == queryCity {
-			matchedFields = append(matchedFields, "city")
-		}
-	}
-
-	// Check state
-	if queryState, exists := query["state_normalized"]; exists && queryState != "" {
-		if result.StateNormalized == queryState {
-			matchedFields = append(matchedFields, "state")
-		}
-	}
-
-	// Check zip
-	if queryZip, exists := query["zip_normalized"]; exists && queryZip != "" {
-		if result.ZipNormalized == queryZip {
-			matchedFields = append(matchedFields, "zip")
-		}
-	}
-
-	// Check phone
-	if queryPhone, exists := query["phone_normalized"]; exists && queryPhone != "" {
-		if result.PhoneNormalized == queryPhone {
-			matchedFields = append(matchedFields, "phone")
-		}
-	}
-
-	// Check email
-	if queryEmail, exists := query["email_normalized"]; exists && queryEmail != "" {
-		if result.EmailNormalized == queryEmail {
-			matchedFields = append(matchedFields, "email")
-		}
-	}
-
-	// Sort fields
-	sort.Strings(matchedFields)
-
 	return matchedFields
 }
 
-// generateExplanation generates a human-readable explanation of the match
-func generateExplanation(matchedFields []string, fieldScores map[string]float32) string {
-	if len(matchedFields) == 0 {
-		return "Matched based on overall similarity"
+// generateExplanation creates a human-readable explanation of the match
+func generateExplanation(score float32, matchedFields []string) string {
+	confidence := "medium"
+	if score >= 0.9 {
+		confidence = "high"
+	} else if score < 0.7 {
+		confidence = "low"
 	}
 
-	if len(matchedFields) == 1 {
-		return fmt.Sprintf("Matched on %s field", matchedFields[0])
-	}
-
-	lastField := matchedFields[len(matchedFields)-1]
-	otherFields := matchedFields[:len(matchedFields)-1]
-
-	return fmt.Sprintf("Matched on %s and %s fields", joinFields(otherFields), lastField)
+	return fmt.Sprintf("Matched with %s confidence (%0.2f) on fields: %s",
+		confidence, score, strings.Join(matchedFields, ", "))
 }
 
-// joinFields joins field names with commas
-func joinFields(fields []string) string {
-	result := ""
-
-	for i, field := range fields {
-		if i > 0 {
-			result += ", "
+// combineFields concatenates field values for embedding
+func combineFields(fields map[string]string) string {
+	var values []string
+	for _, value := range fields {
+		if value != "" {
+			values = append(values, value)
 		}
-		result += field
+	}
+	return strings.Join(values, " ")
+}
+
+// RecomputeClusters recomputes clusters for all entities
+func (s *Service) RecomputeClusters(ctx context.Context) error {
+	if !s.cfg.Clustering.Enabled {
+		return fmt.Errorf("clustering is not enabled in the configuration")
 	}
 
-	return result
+	batchSize := 100 // Process entities in batches
+	return s.clusterService.RecomputeAllClusters(ctx, s.weaviateClient, batchSize)
 }
