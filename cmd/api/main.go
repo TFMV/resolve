@@ -19,11 +19,8 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Get the embedding dimension
-	embeddingDim := cfg.Embedding.EmbeddingDim
-
 	// Run API server
-	if err := api.RunServer(cfg, embeddingDim); err != nil {
+	if err := api.Run(cfg); err != nil {
 		log.Fatalf("API server error: %v", err)
 	}
 }

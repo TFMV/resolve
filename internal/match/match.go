@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/TFMV/resolve/internal/cluster"
 	"github.com/TFMV/resolve/internal/config"
 	"github.com/TFMV/resolve/internal/embed"
 	"github.com/TFMV/resolve/internal/normalize"
@@ -37,6 +38,7 @@ type Options struct {
 	Limit          int
 	Threshold      float32
 	IncludeDetails bool
+	UseClustering  bool // Whether to use clustering
 }
 
 // Service represents the matching service
@@ -45,15 +47,29 @@ type Service struct {
 	normalizer       *normalize.Normalizer
 	embeddingService embed.EmbeddingService
 	weaviateClient   *weaviate.Client
+	clusterService   *cluster.Service
 }
 
 // NewService creates a new matching service
 func NewService(cfg *config.Config, weaviateClient *weaviate.Client, embeddingService embed.EmbeddingService) *Service {
+	// Create normalizer
+	normalizer := normalize.NewNormalizer(cfg)
+
+	// Create cluster service
+	clusterConfig := &cluster.Config{
+		Enabled:             cfg.Clustering.Enabled,
+		Method:              cfg.Clustering.Method,
+		Fields:              cfg.Clustering.Fields,
+		SimilarityThreshold: cfg.Clustering.SimilarityThreshold,
+	}
+	clusterService := cluster.NewService(clusterConfig, normalizer)
+
 	return &Service{
 		cfg:              cfg,
-		normalizer:       normalize.NewNormalizer(cfg),
+		normalizer:       normalizer,
 		embeddingService: embeddingService,
 		weaviateClient:   weaviateClient,
+		clusterService:   clusterService,
 	}
 }
 
@@ -73,6 +89,14 @@ func (s *Service) AddEntity(ctx context.Context, data EntityData) error {
 
 	// Convert to Weaviate entity
 	entity := convertToWeaviateEntity(data.ID, normalizedFields, vector, data.Metadata)
+
+	// Assign cluster ID if clustering is enabled
+	if s.cfg.Clustering.Enabled {
+		_, err = s.clusterService.AssignCluster(ctx, entity)
+		if err != nil {
+			return fmt.Errorf("failed to assign cluster to entity: %w", err)
+		}
+	}
 
 	// Add to Weaviate
 	_, err = s.weaviateClient.AddEntity(ctx, entity)
@@ -103,6 +127,14 @@ func (s *Service) AddEntities(ctx context.Context, dataList []EntityData) error 
 
 		// Convert to Weaviate entity
 		entities[i] = convertToWeaviateEntity(data.ID, normalizedFields, vector, data.Metadata)
+
+		// Assign cluster ID if clustering is enabled
+		if s.cfg.Clustering.Enabled {
+			_, err = s.clusterService.AssignCluster(ctx, entities[i])
+			if err != nil {
+				return fmt.Errorf("failed to assign cluster to entity %d: %w", i, err)
+			}
+		}
 	}
 
 	// Add to Weaviate in batch
@@ -125,16 +157,54 @@ func (s *Service) FindMatches(ctx context.Context, text string, opts Options) ([
 		opts.Threshold = s.cfg.Matching.SimilarityThreshold
 	}
 
+	// Default to using clustering if enabled and not explicitly disabled
+	if !opts.UseClustering {
+		opts.UseClustering = s.cfg.Clustering.Enabled
+	}
+
 	// Generate embedding for the query
 	vector, err := s.embeddingService.GetEmbedding(ctx, text)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate embedding for query: %w", err)
 	}
 
+	// Create a temporary entity to assign a cluster
+	tempEntity := &weaviate.EntityRecord{
+		Name:   text,
+		Vector: vector,
+	}
+
+	// Get cluster filter if clustering is enabled and we should use it
+	var filterParams map[string]string
+	if opts.UseClustering && s.cfg.Clustering.Enabled {
+		_, err = s.clusterService.AssignCluster(ctx, tempEntity)
+		if err != nil {
+			return nil, fmt.Errorf("failed to assign cluster to query: %w", err)
+		}
+
+		filterParams = s.clusterService.GetClusterFilterForEntity(ctx, tempEntity)
+	}
+
+	// Double the limit to account for filtering effect of clustering
+	var searchLimit int
+	if opts.UseClustering && s.cfg.Clustering.Enabled {
+		searchLimit = opts.Limit * 3 // Get more candidates to compensate for cluster filtering
+	} else {
+		searchLimit = opts.Limit
+	}
+
 	// Search in Weaviate
-	results, err := s.weaviateClient.SearchEntities(ctx, vector, opts.Limit, nil)
+	results, err := s.weaviateClient.SearchEntities(ctx, vector, searchLimit, filterParams)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search Weaviate: %w", err)
+	}
+
+	// If no results with cluster filtering and clustering is enabled, try again without filtering
+	if len(results) == 0 && opts.UseClustering && s.cfg.Clustering.Enabled {
+		results, err = s.weaviateClient.SearchEntities(ctx, vector, searchLimit, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to search Weaviate with fallback: %w", err)
+		}
 	}
 
 	// Convert and filter results
@@ -152,6 +222,11 @@ func (s *Service) FindMatches(ctx context.Context, text string, opts Options) ([
 		// Create match result
 		match := convertToMatchResult(result, score, opts.IncludeDetails)
 		matches = append(matches, match)
+	}
+
+	// Limit the final results
+	if len(matches) > opts.Limit {
+		matches = matches[:opts.Limit]
 	}
 
 	return matches, nil
@@ -168,6 +243,11 @@ func (s *Service) FindMatchesForEntity(ctx context.Context, data EntityData, opt
 		opts.Threshold = s.cfg.Matching.SimilarityThreshold
 	}
 
+	// Default to using clustering if enabled and not explicitly disabled
+	if !opts.UseClustering {
+		opts.UseClustering = s.cfg.Clustering.Enabled
+	}
+
 	// Normalize fields
 	normalizedFields := s.normalizer.NormalizeEntity(data.Fields)
 
@@ -180,10 +260,40 @@ func (s *Service) FindMatchesForEntity(ctx context.Context, data EntityData, opt
 		return nil, fmt.Errorf("failed to generate embedding for query: %w", err)
 	}
 
+	// Create entity record for clustering
+	entity := convertToWeaviateEntity(data.ID, normalizedFields, vector, data.Metadata)
+
+	// Get cluster filter if clustering is enabled
+	var filterParams map[string]string
+	if opts.UseClustering && s.cfg.Clustering.Enabled {
+		_, err = s.clusterService.AssignCluster(ctx, entity)
+		if err != nil {
+			return nil, fmt.Errorf("failed to assign cluster to query entity: %w", err)
+		}
+
+		filterParams = s.clusterService.GetClusterFilterForEntity(ctx, entity)
+	}
+
+	// Double the limit to account for filtering effect of clustering
+	var searchLimit int
+	if opts.UseClustering && s.cfg.Clustering.Enabled {
+		searchLimit = opts.Limit * 3 // Get more candidates to compensate for cluster filtering
+	} else {
+		searchLimit = opts.Limit
+	}
+
 	// Search in Weaviate
-	results, err := s.weaviateClient.SearchEntities(ctx, vector, opts.Limit, nil)
+	results, err := s.weaviateClient.SearchEntities(ctx, vector, searchLimit, filterParams)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search Weaviate: %w", err)
+	}
+
+	// If no results with cluster filtering and clustering is enabled, try again without filtering
+	if len(results) == 0 && opts.UseClustering && s.cfg.Clustering.Enabled {
+		results, err = s.weaviateClient.SearchEntities(ctx, vector, searchLimit, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to search Weaviate with fallback: %w", err)
+		}
 	}
 
 	// Convert and filter results
@@ -195,7 +305,6 @@ func (s *Service) FindMatchesForEntity(ctx context.Context, data EntityData, opt
 		}
 
 		// Calculate confidence score from distance (1 - distance)
-		// Weaviate uses cosine distance, so 0 means identical vectors, 2 means opposite vectors
 		score := float32(1.0)
 
 		// Skip if below threshold
@@ -205,14 +314,25 @@ func (s *Service) FindMatchesForEntity(ctx context.Context, data EntityData, opt
 
 		// Create match result
 		match := convertToMatchResult(result, score, opts.IncludeDetails)
-
-		// Compare individual fields to determine matches
-		match.MatchedOn = determineMatchedFields(normalizedFields, result)
-
 		matches = append(matches, match)
 	}
 
+	// Limit the final results
+	if len(matches) > opts.Limit {
+		matches = matches[:opts.Limit]
+	}
+
 	return matches, nil
+}
+
+// RecomputeClusters recomputes clusters for all entities
+func (s *Service) RecomputeClusters(ctx context.Context) error {
+	if !s.cfg.Clustering.Enabled {
+		return fmt.Errorf("clustering is not enabled in the configuration")
+	}
+
+	batchSize := 100 // Process entities in batches
+	return s.clusterService.RecomputeAllClusters(ctx, s.weaviateClient, batchSize)
 }
 
 // GetEntityCount gets the total count of entities in the database

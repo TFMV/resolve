@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/TFMV/resolve/internal/config"
@@ -22,15 +21,16 @@ const (
 )
 
 var (
-	configPath  string
-	showVersion bool
-	ingestFile  string
-	matchFile   string
-	matchString string
-	threshold   float64
-	limit       int
-	withDetails bool
-	showHelp    bool
+	configPath        string
+	showVersion       bool
+	ingestFile        string
+	matchFile         string
+	matchString       string
+	threshold         float64
+	limit             int
+	withDetails       bool
+	showHelp          bool
+	recomputeClusters bool
 )
 
 func main() {
@@ -44,6 +44,7 @@ func main() {
 	flag.IntVar(&limit, "limit", 0, "Maximum number of matches to return")
 	flag.BoolVar(&withDetails, "details", false, "Include match details")
 	flag.BoolVar(&showHelp, "help", false, "Show help information")
+	flag.BoolVar(&recomputeClusters, "recompute-clusters", false, "Recompute clusters for all entities")
 	flag.Parse()
 
 	// Check for help flag
@@ -59,7 +60,7 @@ func main() {
 	}
 
 	// Ensure at least one command is specified
-	if ingestFile == "" && matchFile == "" && matchString == "" {
+	if ingestFile == "" && matchFile == "" && matchString == "" && !recomputeClusters {
 		log.Fatal("Error: No command specified. Use --help for usage information.")
 	}
 
@@ -107,6 +108,10 @@ func main() {
 
 	if matchString != "" {
 		processMatchString(ctx, matchService, matchString, threshold, limit, withDetails)
+	}
+
+	if recomputeClusters {
+		processRecomputeClusters(ctx, matchService)
 	}
 }
 
@@ -207,6 +212,23 @@ func processMatchString(ctx context.Context, matchService *match.Service, queryS
 	}
 }
 
+// processRecomputeClusters handles recomputing clusters for all entities
+func processRecomputeClusters(ctx context.Context, matchService *match.Service) {
+	// Log start
+	log.Printf("Starting cluster recomputation for all entities")
+	startTime := time.Now()
+
+	// Recompute clusters
+	err := matchService.RecomputeClusters(ctx)
+	if err != nil {
+		log.Fatalf("Error recomputing clusters: %v", err)
+	}
+
+	// Log completion
+	duration := time.Since(startTime)
+	log.Printf("Successfully recomputed clusters in %.2f seconds", duration.Seconds())
+}
+
 // printMatches outputs match results in JSON format
 func printMatches(matches []match.MatchResult) {
 	output, err := json.MarshalIndent(matches, "", "  ")
@@ -273,64 +295,26 @@ func defaultConfig() *config.Config {
 
 // printUsage prints usage information
 func printUsage() {
-	binary := filepath.Base(os.Args[0])
-
-	fmt.Printf(`Resolve Entity Matching System v%s
-
-Usage: %s [options] [command]
-
-Options:
-  --config path      Path to configuration file (default: config.yaml)
-  --version          Show version information
-  --help             Show this help information
-
-Commands:
-  --ingest path      Ingest entities from JSON file at path
-  --match-file path  Match entity from JSON file at path
-  --match string     Match a string query
-
-Match Options:
-  --threshold float  Match threshold (0.0-1.0)
-  --limit int        Maximum number of matches to return
-  --details          Include field-level match details
-
-Examples:
-  %s --ingest customers.json
-  %s --match-file query.json --threshold 0.9 --limit 5
-  %s --match "Acme Inc" --details
-
-JSON Input Format for Ingest:
-[
-  {
-    "id": "optional-id-1",
-    "fields": {
-      "name": "Acme Corporation",
-      "address": "123 Main St",
-      "city": "New York",
-      "state": "NY",
-      "zip": "10001",
-      "phone": "+1 555-123-4567",
-      "email": "info@acme.com"
-    },
-    "metadata": {
-      "source": "CRM",
-      "type": "customer"
-    }
-  },
-  ...
-]
-
-JSON Input Format for Match:
-{
-  "id": "optional-id",
-  "fields": {
-    "name": "Acme Corp",
-    "address": "123 Main Street",
-    "city": "New York",
-    "state": "NY",
-    "zip": "10001"
-  }
-}
-
-`, version, binary, binary, binary, binary)
+	fmt.Println("Resolve Entity Matching System")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  resolve [flags]")
+	fmt.Println()
+	fmt.Println("Flags:")
+	fmt.Println("  --config string       Path to configuration file (default \"config.yaml\")")
+	fmt.Println("  --ingest string       Path to JSON file with entities to ingest")
+	fmt.Println("  --match-file string   Path to JSON file with entity to match")
+	fmt.Println("  --match string        Entity string to match")
+	fmt.Println("  --threshold float     Match threshold (0.0-1.0)")
+	fmt.Println("  --limit int           Maximum number of matches to return")
+	fmt.Println("  --details             Include match details")
+	fmt.Println("  --recompute-clusters  Recompute clusters for all entities")
+	fmt.Println("  --version             Show version information")
+	fmt.Println("  --help                Show this help information")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  resolve --ingest entities.json")
+	fmt.Println("  resolve --match-file query.json --threshold 0.8 --limit 5")
+	fmt.Println("  resolve --match \"Acme Corporation\" --threshold 0.7")
+	fmt.Println("  resolve --recompute-clusters")
 }
