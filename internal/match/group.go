@@ -54,6 +54,7 @@ func (s *Service) GetMatchGroup(ctx context.Context, entityID string, opts Match
 		return nil, fmt.Errorf("failed to retrieve entity %s: %w", entityID, err)
 	}
 
+	//
 	// Create the match group with the primary entity
 	group := &MatchGroup{
 		ID:        entityID,
