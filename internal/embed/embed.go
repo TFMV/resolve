@@ -105,80 +105,95 @@ func (c *HTTPClient) GetEmbeddingBatch(ctx context.Context, texts []string) ([][
 		return [][]float32{}, nil
 	}
 
-	// Process in batches
 	batchSize := c.batchSize
 	if batchSize <= 0 {
 		batchSize = 32
 	}
 
-	// Check if we can fulfill from cache
-	allCached := true
-	cachedEmbeddings := make([][]float32, len(texts))
+	results := make([][]float32, len(texts))
+
+	// First attempt to satisfy from cache
+	missingTexts := make([]string, 0)
+	missingIdx := make([]int, 0)
 
 	c.cacheMutex.RLock()
-	for i, text := range texts {
-		emb, found := c.cache[text]
-		if !found {
-			allCached = false
-			break
+	for i, t := range texts {
+		if emb, ok := c.cache[t]; ok {
+			results[i] = emb
+		} else {
+			missingTexts = append(missingTexts, t)
+			missingIdx = append(missingIdx, i)
 		}
-		cachedEmbeddings[i] = emb
 	}
 	c.cacheMutex.RUnlock()
 
-	if allCached {
-		return cachedEmbeddings, nil
+	if len(missingTexts) == 0 {
+		return results, nil
 	}
 
-	// Need to make an HTTP request
-	req := embeddingRequest{
-		Texts:     texts,
-		ModelName: c.modelName,
-	}
-
-	jsonData, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", c.url+"/embed", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	var result embeddingResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if result.Error != "" {
-		return nil, fmt.Errorf("embedding service error: %s", result.Error)
-	}
-
-	// Cache the results
-	c.cacheMutex.Lock()
-	for i, text := range texts {
-		if len(c.cache) >= c.cacheSize {
-			break
+	// Fetch missing embeddings in batches
+	fetched := 0
+	for fetched < len(missingTexts) {
+		end := fetched + batchSize
+		if end > len(missingTexts) {
+			end = len(missingTexts)
 		}
-		c.cache[text] = result.Embeddings[i]
-	}
-	c.cacheMutex.Unlock()
 
-	return result.Embeddings, nil
+		req := embeddingRequest{
+			Texts:     missingTexts[fetched:end],
+			ModelName: c.modelName,
+		}
+
+		jsonData, err := json.Marshal(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal request: %w", err)
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", c.url+"/embed", bytes.NewBuffer(jsonData))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("failed to send request: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, fmt.Errorf("unexpected status code: %d, body: %s", resp.StatusCode, string(body))
+		}
+
+		var res embeddingResponse
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+		resp.Body.Close()
+
+		if res.Error != "" {
+			return nil, fmt.Errorf("embedding service error: %s", res.Error)
+		}
+
+		if len(res.Embeddings) != end-fetched {
+			return nil, fmt.Errorf("unexpected embeddings count")
+		}
+
+		c.cacheMutex.Lock()
+		for i := range res.Embeddings {
+			idx := missingIdx[fetched+i]
+			results[idx] = res.Embeddings[i]
+			if len(c.cache) < c.cacheSize {
+				c.cache[missingTexts[fetched+i]] = res.Embeddings[i]
+			}
+		}
+		c.cacheMutex.Unlock()
+
+		fetched = end
+	}
+
+	return results, nil
 }
 
 // Health checks if the embedding service is healthy
