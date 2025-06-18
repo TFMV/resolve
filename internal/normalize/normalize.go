@@ -10,24 +10,32 @@ import (
 
 // Normalizer provides methods to normalize entity fields
 type Normalizer struct {
-	cfg                 *config.Config
-	legalSuffixRegex    *regexp.Regexp
-	addressRegex        *regexp.Regexp
-	phoneRegex          *regexp.Regexp
-	emailRegex          *regexp.Regexp
-	streetAbbreviations map[string]string
-	stateCodes          map[string]string
-	stopwords           map[string]bool
+	cfg                  *config.Config
+	legalSuffixRegex     *regexp.Regexp
+	addressRegex         *regexp.Regexp
+	phoneRegex           *regexp.Regexp
+	emailRegex           *regexp.Regexp
+	spaceRegex           *regexp.Regexp
+	initialsRegex        *regexp.Regexp
+	apartmentRegex       *regexp.Regexp
+	nonAlphanumericRegex *regexp.Regexp
+	streetAbbreviations  map[string]string
+	stateCodes           map[string]string
+	stopwords            map[string]bool
 }
 
 // NewNormalizer creates a new normalizer with the given configuration
 func NewNormalizer(cfg *config.Config) *Normalizer {
 	n := &Normalizer{
-		cfg:              cfg,
-		legalSuffixRegex: regexp.MustCompile(`(?i)\s+(inc\.?|incorporated|corp\.?|corporation|llc|ltd\.?|limited|llp|l\.l\.p\.?|pllc|p\.l\.l\.c\.?|pc|p\.c\.?)$`),
-		addressRegex:     regexp.MustCompile(`(?i)(\d+)\s+([a-z0-9\.\-\s]+)\s+(st|street|ave|avenue|blvd|boulevard|rd|road|ln|lane|way|dr|drive|court|ct|plaza|square|sq|parkway|pkwy)\.?`),
-		phoneRegex:       regexp.MustCompile(`^(?:\+?(\d{1,3}))?[-. (]*(\d{3})[-. )]*(\d{3})[-. ]*(\d{4})$`),
-		emailRegex:       regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`),
+		cfg:                  cfg,
+		legalSuffixRegex:     regexp.MustCompile(`(?i)\s+(inc\.?|incorporated|corp\.?|corporation|llc|ltd\.?|limited|llp|l\.l\.p\.?|pllc|p\.l\.l\.c\.?|pc|p\.c\.?)$`),
+		addressRegex:         regexp.MustCompile(`(?i)(\d+)\s+([a-z0-9\.\-\s]+)\s+(st|street|ave|avenue|blvd|boulevard|rd|road|ln|lane|way|dr|drive|court|ct|plaza|square|sq|parkway|pkwy)\.?`),
+		phoneRegex:           regexp.MustCompile(`^(?:\+?(\d{1,3}))?[-. (]*(\d{3})[-. )]*(\d{3})[-. ]*(\d{4})$`),
+		emailRegex:           regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`),
+		spaceRegex:           regexp.MustCompile(`\s+`),
+		initialsRegex:        regexp.MustCompile(`\b([A-Z])\.?\b`),
+		apartmentRegex:       regexp.MustCompile(`(?i)(\s+)(apt|apartment|ste|suite|unit|#)\.?\s+[a-z0-9-]+`),
+		nonAlphanumericRegex: regexp.MustCompile(`[^0-9a-zA-Z]`),
 		streetAbbreviations: map[string]string{
 			"street":    "st",
 			"avenue":    "ave",
@@ -127,8 +135,7 @@ func (n *Normalizer) NormalizeText(text string) string {
 
 	// Remove extra whitespace
 	text = strings.TrimSpace(text)
-	re := regexp.MustCompile(`\s+`)
-	text = re.ReplaceAllString(text, " ")
+	text = n.spaceRegex.ReplaceAllString(text, " ")
 
 	// Remove stopwords if enabled
 	if n.cfg.Normalization.EnableStopwords {
@@ -163,8 +170,7 @@ func (n *Normalizer) NormalizeName(name string) string {
 
 	// Normalize initials
 	if n.cfg.Normalization.NameOptions["normalize_initials"] {
-		re := regexp.MustCompile(`\b([A-Z])\.?\b`)
-		name = re.ReplaceAllString(name, "$1")
+		name = n.initialsRegex.ReplaceAllString(name, "$1")
 	}
 
 	return strings.TrimSpace(name)
@@ -189,8 +195,7 @@ func (n *Normalizer) NormalizeAddress(address string) string {
 
 	// Remove apartment/suite numbers
 	if n.cfg.Normalization.AddressOptions["remove_apartment_numbers"] {
-		re := regexp.MustCompile(`(?i)(\s+)(apt|apartment|ste|suite|unit|#)\.?\s+[a-z0-9-]+`)
-		address = re.ReplaceAllString(address, "")
+		address = n.apartmentRegex.ReplaceAllString(address, "")
 	}
 
 	return strings.TrimSpace(address)
@@ -278,8 +283,7 @@ func (n *Normalizer) NormalizeZip(zip string) string {
 	}
 
 	// Remove any non-alphanumeric characters
-	re := regexp.MustCompile(`[^0-9a-zA-Z]`)
-	zip = re.ReplaceAllString(zip, "")
+	zip = n.nonAlphanumericRegex.ReplaceAllString(zip, "")
 
 	// For US ZIP codes, take the first 5 digits
 	if len(zip) >= 5 && unicode.IsDigit(rune(zip[0])) {
